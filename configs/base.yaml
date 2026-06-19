@@ -1,0 +1,38 @@
+top_n: 30
+lookback_days: 30
+min_listing_days: 90
+min_liquidity_monthly_threshold: 50000.0
+min_liquidity_7d_threshold: 50000.0
+raw_dir: src/data/raw/master_q4.nosync
+data_start_date: 2020-09-30 23:59:59+00:00
+data_end_date: 2025-12-31 23:59:59+00:00
+
+warning_thresholds:
+  extreme_return_abs: 0.2
+  large_symbol_gap_hours: 1.0
+  liquidity_collapse_ratio: 0.2
+  lifecycle_start_late_days: 90.0
+  lifecycle_end_early_days: 90.0
+  short_life_min_rows: 2160
+  high_universe_turnover: 0.5
+
+excluded_bases:
+  - USDT
+  - USDC
+  - DAI
+  - TUSD
+  - USDP
+  - BUSD
+  - FDUSD
+  - PYUSD
+  - CHIP
+  - EURC
+  - STBL
+  - PAXG
+  - ENA
+  - EUR
+  - GBP
+  - JPY
+  - CHF
+  - AUD
+  - CAD

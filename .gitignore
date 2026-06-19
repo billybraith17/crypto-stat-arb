@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+scratch/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+
+# Editor / local tooling
+.vscode/
+.claude/
+CLAUDE.md
+
+# OS
+.DS_Store
+
+# Raw data (large, not for the repo)
+src/data/raw/
+src/data/interim/
+*.nosync/

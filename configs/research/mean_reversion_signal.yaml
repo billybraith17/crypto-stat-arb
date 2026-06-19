@@ -1,0 +1,61 @@
+reference_base_config: configs/base.yaml
+
+# Timeframe and trading-cadence controls.
+signal_timeframe: 1h
+rebalance_every_n_bars: 2
+holding_period_bars: 2
+execution_delay_bars: 0
+
+# Core signal window.  Short horizons capture intra-day / overnight reversals.
+# At 4h bars: reversal_lookback_bars=2 → 8h lookback, feature_horizons_bars=[1,2,4,6] → [4h–24h].
+reversal_lookback_bars: 2
+log_returns: true
+
+# Volatility / normalisation windows (in signal bars).
+vol_window_bars: 14
+price_zscore_window_bars: 24
+bollinger_window_bars: 20
+vwap_window_bars: 24
+volume_window_bars: 24
+rsi_window_bars: 14
+range_position_window_bars: 12
+
+# Extreme-move indicator threshold (|z-score| > threshold_sigma).
+extreme_move_threshold_sigma: 2.0
+
+# Benchmark used for relative features.
+benchmark_symbol: XBT/USD
+# Relative residuals: "log" (same units as core returns) or "simple" (P&L-aligned).
+residual_space: log
+
+# Feature families to compare (in signal bars).
+# [1, 2, 4, 6] = [4h, 8h, 16h, 24h] at 4h cadence — short-term reversals.
+feature_horizons_bars: [1, 2, 4, 6]
+
+# Robustness grid parameters.
+momentum_lookback_grid_bars: [1, 2, 4, 6]
+holding_period_grid_bars: [1, 2, 3, 4]
+cross_sectional_transform_grid: [rank]
+universe_top_n_grid: [10, 20]
+
+# Universe and data controls.
+use_monthly_universe: true
+max_assets: 20
+data_start_date: 2020-09-30 23:59:59+00:00
+data_end_date: 2024-06-30 23:59:59+00:00
+train_split_date: 2022-06-30 23:59:59+00:00
+
+# Signal post-processing.
+cross_sectional_transform: rank
+min_assets_per_timestamp: 6
+
+# Portfolio and costs.
+top_quantile: 0.2
+bottom_quantile: 0.2
+fee_bps: 40.0
+half_spread_bps: 1.0
+cost_stress_multipliers: [0.0, 1.0, 1.5, 2.0]
+
+# Robustness diagnostics.
+rolling_window_bars: 360
+extreme_event_quantile: 0.99

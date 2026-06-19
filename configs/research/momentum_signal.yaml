@@ -1,0 +1,47 @@
+reference_base_config: configs/base.yaml
+
+# Timeframe and trading-cadence controls.
+signal_timeframe: 24h
+rebalance_every_n_bars: 1
+holding_period_bars: 20
+execution_delay_bars: 0
+
+# Signal and evaluation windows (measured in signal bars).
+momentum_lookback_bars: 30 
+# Jegadeesh-Titman style skip to avoid very recent reversal noise (4h bars).
+momentum_skip_bars: 1
+log_returns: true
+vol_window_bars: 14
+benchmark_symbol: XBT/USD
+# Relative residuals: "log" (same units as core returns) or "simple" (P&L-aligned).
+residual_space: log
+
+# Feature families to compare. Horizons are in signal bars (4h each at the
+# default signal_timeframe), so [1, 3, 6, 12] = [4h, 12h, 24h, 48h].
+feature_horizons_bars: [5, 10, 20, 40, 60]
+momentum_skip_grid_bars: [1, 2, 3]
+holding_period_grid_bars: [1, 3, 5, 10, 14, 21, 30, 40]
+cross_sectional_transform_grid: [rank]
+universe_top_n_grid: [10, 20]
+
+# Universe and data controls.
+use_monthly_universe: true
+max_assets: 20
+data_start_date: 2020-09-30 23:59:59+00:00
+data_end_date: 2024-06-30 23:59:59+00:00
+train_split_date: 2022-06-30 23:59:59+00:00
+
+# Signal post-processing.
+cross_sectional_transform: rank
+min_assets_per_timestamp: 6
+
+# Portfolio and costs.
+top_quantile: 0.2
+bottom_quantile: 0.2
+fee_bps: 40.0
+half_spread_bps: 1.0
+cost_stress_multipliers: [0.0, 1.0, 1.5, 2.0]
+
+# Robustness diagnostics.
+rolling_window_bars: 60
+extreme_event_quantile: 0.99
