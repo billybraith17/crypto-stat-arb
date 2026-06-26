@@ -1,13 +1,10 @@
 pandas==2.3.3
 numpy==2.2.6
 scipy==1.15.3
-scikit-learn==1.7.2
-ccxt==4.5.50
-pyarrow==24.0.0
 matplotlib==3.10.8
-streamlit==1.56.0
 sqlalchemy==2.0.49
 psycopg2_binary==2.9.12
-dotenv==0.9.9
+PyYAML==6.0.3
+python-dotenv==1.2.2
 ipykernel==7.2.0
 pytest>=8.0
