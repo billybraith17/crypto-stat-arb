@@ -333,6 +333,28 @@ def run_light_backtest(
     return) are dropped, so cumulative series and Sharpe are computed only on
     the priceable subset. ``annualized_turnover`` is reported alongside the
     per-period mean for interpretability.
+
+    ``holding_period_bars`` is the single trading-cadence mechanism: pass the
+    pre-decimation signal (decimation via ``apply_rebalance_decimation`` is an
+    IC-analysis device and layering it under the H-stepping here produces
+    phase-dependent staleness). ``execution_delay_bars`` shifts weights by
+    whole signal bars — implementation lag, distinct from a Jegadeesh-Titman
+    ``skip_bars`` which is part of the feature definition. For sub-bar delays,
+    embed the delay in the forward-return panel instead
+    (``src.research.execution``) and keep ``execution_delay_bars=0``.
+
+    Rebalances are netted at a single print: the old book exits and the new
+    book enters at the same execution close, with costs charged on net
+    turnover ``0.5 * sum(|dw|)``. Weight drift within the holding period is
+    ignored (light backtest).
+
+    ``half_spread_bps`` may be a scalar (flat spread for all assets) or a
+    per-symbol ``pd.Series`` in bps (e.g. from
+    ``src.research.spreads.estimate_half_spread_bps_from_long``), in which
+    case each asset's turnover is charged at its own rate — flat spreads
+    understate costs on the illiquid tail of the universe. Symbols missing
+    from the Series (or NaN) are filled with the cross-sectional median of
+    the supplied values; pass explicit values to override.
     """
     H = max(int(holding_period_bars), 1)
 
@@ -365,9 +387,16 @@ def run_light_backtest(
     gross_ret = (weights_step * realized_step).sum(axis=1, min_count=1)
     gross_ret = gross_ret.where(~bar_unpriceable, np.nan)
 
-    turnover = 0.5 * weights_step.fillna(0.0).diff().abs().sum(axis=1)
-    cost_rate = (float(fee_bps) + float(half_spread_bps)) * 1e-4
-    costs = turnover * cost_rate
+    turnover_by_asset = 0.5 * weights_step.fillna(0.0).diff().abs()
+    turnover = turnover_by_asset.sum(axis=1)
+    if isinstance(half_spread_bps, pd.Series):
+        spread_by_symbol = half_spread_bps.reindex(weights_step.columns)
+        spread_by_symbol = spread_by_symbol.fillna(half_spread_bps.median())
+        rate_by_symbol = (float(fee_bps) + spread_by_symbol) * 1e-4
+        costs = turnover_by_asset.mul(rate_by_symbol, axis=1).sum(axis=1)
+    else:
+        cost_rate = (float(fee_bps) + float(half_spread_bps)) * 1e-4
+        costs = turnover * cost_rate
     net_ret = gross_ret - costs
 
     # Trim to the priceable holding window: from the first bar where weights
@@ -502,3 +531,246 @@ def market_correlation(series, benchmark):
     if aligned.empty:
         return np.nan
     return float(aligned["x"].corr(aligned["y"]))
+
+
+# ---------------------------------------------------------------------------
+# Selection-bias corrections (multiple testing)
+# ---------------------------------------------------------------------------
+
+_EULER_GAMMA = 0.5772156649015329
+
+
+def max_over_trials_pvalue(t_stat, n_trials):
+    """P(max of ``n_trials`` independent N(0,1) draws >= ``t_stat``).
+
+    The honest null for "the best of N features/configurations has t = X" is
+    the maximum of N t-stats, not a single one: ``1 - Phi(t)^N``. Features in
+    a grid are correlated, so the true trial count lies between 1 and N —
+    bracket the p-value by calling this with both, or pass an effective count
+    (e.g. the number of distinct feature families).
+    """
+    from scipy.stats import norm
+
+    n = int(n_trials)
+    if n < 1:
+        raise ValueError("n_trials must be >= 1")
+    if pd.isna(t_stat):
+        return np.nan
+    return float(1.0 - norm.cdf(t_stat) ** n)
+
+
+def expected_max_sharpe(n_trials, var_sharpe, mean_sharpe=0.0):
+    """Expected maximum Sharpe across ``n_trials`` under the no-skill null.
+
+    Bailey & Lopez de Prado (2014): if trial Sharpes are ~N(mean, var), the
+    expected maximum of N trials is approximately::
+
+        mean + sd * ((1 - gamma) * Z(1 - 1/N) + gamma * Z(1 - 1/(N*e)))
+
+    with ``gamma`` the Euler-Mascheroni constant and ``Z`` the standard normal
+    quantile. Units are whatever the inputs use — pass *per-period* (non-
+    annualized) Sharpes and the cross-trial variance of those same Sharpes.
+    """
+    from scipy.stats import norm
+
+    n = int(n_trials)
+    if n < 1:
+        raise ValueError("n_trials must be >= 1")
+    if n == 1:
+        return float(mean_sharpe)
+    sd = float(np.sqrt(var_sharpe))
+    return float(
+        mean_sharpe
+        + sd
+        * (
+            (1.0 - _EULER_GAMMA) * norm.ppf(1.0 - 1.0 / n)
+            + _EULER_GAMMA * norm.ppf(1.0 - 1.0 / (n * np.e))
+        )
+    )
+
+
+def probabilistic_sharpe_ratio(sharpe, benchmark_sharpe, n_obs, skew=0.0, kurt=3.0):
+    """P(true Sharpe > ``benchmark_sharpe``) given an observed per-period Sharpe.
+
+    Standard PSR (Bailey & Lopez de Prado): the sampling error of the Sharpe
+    estimator is widened for skewed / fat-tailed returns via ``skew`` and
+    ``kurt`` (Pearson kurtosis, normal = 3). All Sharpes per-period.
+    """
+    from scipy.stats import norm
+
+    n = int(n_obs)
+    if n < 2:
+        return np.nan
+    var_term = 1.0 - skew * sharpe + (kurt - 1.0) / 4.0 * sharpe**2
+    if not np.isfinite(var_term) or var_term <= 0:
+        return np.nan
+    z = (sharpe - benchmark_sharpe) * np.sqrt(n - 1.0) / np.sqrt(var_term)
+    return float(norm.cdf(z))
+
+
+def deflated_sharpe_ratio(
+    sharpe,
+    n_obs,
+    n_trials,
+    var_sharpe,
+    skew=0.0,
+    kurt=3.0,
+    mean_sharpe=0.0,
+):
+    """Deflated Sharpe ratio: PSR against the expected max of N no-skill trials.
+
+    Converts "the best configuration in the grid has Sharpe X" into the
+    probability that its true Sharpe exceeds what pure selection over
+    ``n_trials`` correlated-noise trials would deliver. Values near 0.5 mean
+    the winner is indistinguishable from the luckiest of N noise strategies;
+    conventionally require >= 0.95.
+
+    Parameters use *per-period* units: divide annualized Sharpes by
+    ``sqrt(periods_per_year)``, take ``var_sharpe`` as the cross-trial
+    variance of those per-period Sharpes, and ``skew``/``kurt`` from the
+    winning strategy's per-period returns.
+    """
+    sr_star = expected_max_sharpe(n_trials, var_sharpe, mean_sharpe=mean_sharpe)
+    dsr = probabilistic_sharpe_ratio(sharpe, sr_star, n_obs, skew=skew, kurt=kurt)
+    return {
+        "expected_max_sharpe": sr_star,
+        "deflated_sharpe_prob": dsr,
+        "n_trials": int(n_trials),
+        "n_obs": int(n_obs),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Walk-forward evaluation with embargo
+# ---------------------------------------------------------------------------
+
+
+def walk_forward_splits(index, n_folds=5, embargo_obs=0):
+    """Split an ordered index into contiguous folds with an embargo.
+
+    Overlapping signal-lookback / forward-return windows make observations
+    near a fold boundary share data with the previous fold, so the first
+    ``embargo_obs`` observations of every fold after the first are dropped.
+    ``embargo_obs`` is in units of *observations of the series being split* —
+    if the IC series is subsampled every D bars, convert bar-overlap
+    ``max(H, R) - 1`` to ``(max(H, R) - 1) // D``.
+
+    Returns a list of ``{"fold", "test_index"}`` dicts (folds are 1-based).
+    """
+    n_folds = int(n_folds)
+    embargo = int(embargo_obs)
+    if n_folds < 2:
+        raise ValueError("n_folds must be >= 2")
+    if embargo < 0:
+        raise ValueError("embargo_obs must be >= 0")
+    n = len(index)
+    if n < n_folds:
+        raise ValueError(f"index has {n} observations, fewer than n_folds={n_folds}")
+
+    edges = np.linspace(0, n, n_folds + 1, dtype=int)
+    splits = []
+    for k in range(n_folds):
+        start, stop = edges[k], edges[k + 1]
+        if k > 0:
+            start = min(start + embargo, stop)
+        splits.append({"fold": k + 1, "test_index": index[start:stop]})
+    return splits
+
+
+def walk_forward_ic_table(ic_series, n_folds=5, embargo_obs=0, nw_lag=0):
+    """Per-fold IC stability table for a fixed (pre-selected) signal.
+
+    Splits the IC series into ``n_folds`` contiguous blocks (embargoed as in
+    ``walk_forward_splits``) and reports ``ic_summary`` per block. A robust
+    signal shows same-sign mean IC of similar magnitude across folds; a
+    regime artifact shows one or two dominant folds.
+    """
+    clean = ic_series.dropna()
+    rows = []
+    for split in walk_forward_splits(clean.index, n_folds=n_folds, embargo_obs=embargo_obs):
+        block = clean.loc[split["test_index"]]
+        stats = ic_summary(block, nw_lag=nw_lag)
+        rows.append(
+            {
+                "fold": split["fold"],
+                "start": block.index.min() if len(block) else pd.NaT,
+                "end": block.index.max() if len(block) else pd.NaT,
+                "n_obs": stats["n_obs"],
+                "mean_ic": stats["mean_ic"],
+                "t_stat_ic_nw": stats["t_stat_ic_nw"],
+            }
+        )
+    return pd.DataFrame(rows).set_index("fold")
+
+
+def walk_forward_selection(
+    ic_series_by_config,
+    n_folds=5,
+    embargo_obs=0,
+    nw_lag_by_config=None,
+):
+    """Honest grid evaluation: select on past folds, score on the next fold.
+
+    For each test fold ``k >= 2``, the configuration with the best mean IC
+    over *all observations before the fold* (minus the embargo tail) is
+    selected, and its IC over fold ``k`` is recorded. The pooled
+    out-of-sample series therefore never uses data that influenced the
+    selection — unlike sorting a robustness grid by full-sample IC.
+
+    Parameters
+    ----------
+    ic_series_by_config : dict[label, pd.Series]
+        Precomputed IC series per configuration (as produced inside the
+        robustness-grid loops).
+    nw_lag_by_config : dict[label, int] or None
+        NW lag per configuration for the pooled summary; the maximum over
+        the selected configurations is used (conservative). None -> 0.
+
+    Returns
+    -------
+    (selection_table, pooled_stats): per-fold DataFrame with the selected
+    config and its in-selection vs out-of-sample mean IC, and an
+    ``ic_summary`` dict over the concatenated out-of-sample ICs.
+    """
+    if not ic_series_by_config:
+        raise ValueError("ic_series_by_config is empty")
+    panel = pd.DataFrame({k: v for k, v in ic_series_by_config.items()}).sort_index()
+
+    splits = walk_forward_splits(panel.index, n_folds=n_folds, embargo_obs=embargo_obs)
+    embargo = int(embargo_obs)
+
+    rows = []
+    oos_segments = []
+    used_configs = set()
+    for split in splits[1:]:
+        test_idx = split["test_index"]
+        if len(test_idx) == 0:
+            continue
+        fold_start_pos = panel.index.get_loc(test_idx[0])
+        sel_stop = max(fold_start_pos - embargo, 0)
+        selection_window = panel.iloc[:sel_stop]
+        sel_means = selection_window.mean()
+        if sel_means.isna().all():
+            continue
+        best = sel_means.idxmax()
+        used_configs.add(best)
+        oos_block = panel.loc[test_idx, best].dropna()
+        oos_segments.append(oos_block)
+        rows.append(
+            {
+                "fold": split["fold"],
+                "selected_config": best,
+                "selection_mean_ic": float(sel_means[best]),
+                "oos_mean_ic": float(oos_block.mean()) if len(oos_block) else np.nan,
+                "oos_n_obs": int(len(oos_block)),
+            }
+        )
+
+    selection_table = pd.DataFrame(rows).set_index("fold") if rows else pd.DataFrame()
+    pooled = pd.concat(oos_segments) if oos_segments else pd.Series(dtype=float)
+    if nw_lag_by_config:
+        pooled_lag = max(int(nw_lag_by_config.get(c, 0)) for c in used_configs) if used_configs else 0
+    else:
+        pooled_lag = 0
+    pooled_stats = ic_summary(pooled, nw_lag=pooled_lag)
+    return selection_table, pooled_stats

@@ -230,9 +230,12 @@ class TestICSummary:
 
 class TestRollingHelpers:
     def test_rolling_mean_window(self):
+        # rolling_mean uses min_periods=int(0.9*window): with window=3 that is
+        # 2 observations, so values appear from position 1 onwards.
         s = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
         rm = rolling_mean(s, window=3)
-        assert np.isnan(rm.iloc[0]) and np.isnan(rm.iloc[1])
+        assert np.isnan(rm.iloc[0])
+        assert abs(rm.iloc[1] - 1.5) < 1e-12
         assert abs(rm.iloc[2] - 2.0) < 1e-12
 
     def test_rolling_sharpe_positive_for_upward_drift(self):
@@ -511,3 +514,64 @@ class TestMarketCorrelation:
         a = pd.Series(np.ones(5), index=idx_a)
         b = pd.Series(np.ones(5), index=idx_b)
         assert np.isnan(market_correlation(a, b))
+
+
+# ---------------------------------------------------------------------------
+# Trading cadence: decimation is an IC device, holding_period_bars is the
+# single backtest cadence mechanism
+# ---------------------------------------------------------------------------
+
+class TestCadenceSemantics:
+    def _random_signal(self, index, columns, seed=7):
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame(
+            rng.normal(size=(len(index), len(columns))),
+            index=index,
+            columns=columns,
+        )
+
+    def test_decimation_redundant_when_phase_aligned(self, multi_symbol_close_wide):
+        """With D == H and aligned phase, feeding the decimated signal to the
+        backtest changes nothing — so the fresh signal is always safe."""
+        from src.signals.cs_momentum import (
+            apply_rebalance_decimation,
+            compute_forward_returns,
+        )
+
+        close = multi_symbol_close_wide
+        D = 2
+        sig_fresh = self._random_signal(close.index, close.columns)
+        sig_dec = apply_rebalance_decimation(sig_fresh, D)
+        fwd = compute_forward_returns(close, holding_period_bars=D)
+
+        kwargs = dict(fee_bps=0.0, half_spread_bps=0.0, holding_period_bars=D)
+        bt_fresh = run_light_backtest(sig_fresh, fwd, **kwargs)
+        bt_dec = run_light_backtest(sig_dec, fwd, **kwargs)
+
+        pd.testing.assert_frame_equal(bt_fresh["weights"], bt_dec["weights"])
+        pd.testing.assert_series_equal(bt_fresh["net_returns"], bt_dec["net_returns"])
+
+    def test_mismatched_decimation_trades_stale_signal(self, multi_symbol_close_wide):
+        """With D=2 decimation under H=3 stepping, the step at bar 3 trades the
+        bar-2 signal — the phase-dependent staleness that motivated moving all
+        backtests to the pre-decimation signal."""
+        from src.signals.cs_momentum import (
+            apply_rebalance_decimation,
+            compute_forward_returns,
+        )
+
+        close = multi_symbol_close_wide
+        D, H = 2, 3
+        sig_fresh = self._random_signal(close.index, close.columns)
+        sig_dec = apply_rebalance_decimation(sig_fresh, D)
+        fwd = compute_forward_returns(close, holding_period_bars=H)
+
+        bt_dec = run_light_backtest(
+            sig_dec, fwd, fee_bps=0.0, half_spread_bps=0.0, holding_period_bars=H
+        )
+        fresh_weights = build_quantile_weights(sig_fresh)
+        step_bar = close.index[3]
+
+        stale = bt_dec["weights"].loc[step_bar].fillna(0.0)
+        assert np.allclose(stale, fresh_weights.iloc[2].fillna(0.0))
+        assert not np.allclose(stale, fresh_weights.iloc[3].fillna(0.0))

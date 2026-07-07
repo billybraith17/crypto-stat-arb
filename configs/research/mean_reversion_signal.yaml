@@ -1,10 +1,20 @@
 reference_base_config: configs/base.yaml
 
 # Timeframe and trading-cadence controls.
+# holding_period_bars is the single trading-cadence knob: the backtest
+# rebalances every H bars on a fresh signal and holds H bars.
+# ic_rebalance_bars decimates the signal for IC analysis only.
 signal_timeframe: 1h
-rebalance_every_n_bars: 2
+ic_rebalance_bars: 2
 holding_period_bars: 2
 execution_delay_bars: 0
+
+# Minute-level execution modelling: entry/exit at signal close + delta
+# minutes, priced from real 1m closes (ohlcv_1m). execution_delay_bars must
+# stay 0 when enabled — the delay lives in the execution price panel.
+use_minute_execution: true
+execution_delay_minutes: 1
+execution_delay_minutes_grid: [0, 1, 5, 15, 30, 60]
 
 # Core signal window.  Short horizons capture intra-day / overnight reversals.
 # At 4h bars: reversal_lookback_bars=2 → 8h lookback, feature_horizons_bars=[1,2,4,6] → [4h–24h].

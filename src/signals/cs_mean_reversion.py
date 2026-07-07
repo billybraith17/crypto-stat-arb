@@ -459,7 +459,7 @@ def build_mean_reversion_signal(
     cross_sectional_transform="rank",
     min_assets_per_timestamp=6,
     log_returns=True,
-    rebalance_every_n_bars=1,
+    ic_rebalance_bars=1,
 ):
     """End-to-end mean-reversion signal from long OHLCV rows.
 
@@ -474,7 +474,10 @@ def build_mean_reversion_signal(
       ``"volume_wide"``   — resampled volume panel (ts × symbol, sum)
       ``"return_wide"``   — bar-by-bar log returns
       ``"raw_signal"``    — negated rolling return (pre-transform)
-      ``"signal"``        — cross-sectionally normalised signal
+      ``"signal"``        — normalised signal, decimated by `ic_rebalance_bars`
+                            (IC analysis only)
+      ``"signal_fresh"``  — normalised signal pre-decimation (use in backtests;
+                            trading cadence there is `holding_period_bars`)
       ``"universe_mask"`` — boolean ts × symbol mask (or None)
     """
     close_wide = resample_to_signal_timeframe(df_long, signal_timeframe)
@@ -500,12 +503,12 @@ def build_mean_reversion_signal(
     if universe_mask is not None:
         raw_signal = raw_signal.where(universe_mask)
 
-    signal = cross_sectional_rank_or_zscore(
+    signal_fresh = cross_sectional_rank_or_zscore(
         raw_signal,
         method=cross_sectional_transform,
         min_assets_per_timestamp=min_assets_per_timestamp,
     )
-    signal = apply_rebalance_decimation(signal, rebalance_every_n_bars)
+    signal = apply_rebalance_decimation(signal_fresh, ic_rebalance_bars)
 
     return {
         "close_wide": close_wide,
@@ -513,5 +516,6 @@ def build_mean_reversion_signal(
         "return_wide": ret_wide,
         "raw_signal": raw_signal,
         "signal": signal,
+        "signal_fresh": signal_fresh,
         "universe_mask": universe_mask,
     }

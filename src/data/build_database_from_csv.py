@@ -95,7 +95,12 @@ def read_raw_csv(path):
 # =====================================================
 # CLEAN + FILL MISSING HOURS
 # =====================================================
-def prepare_dataframe(df, base, quote, symbol, data_start_date, data_end_date):
+def _clean_raw_frame(df, data_start_date, data_end_date):
+    """Coerce types, build UTC `ts`, apply date cutoffs, sort and dedupe.
+
+    Shared by the hourly loader (which then densifies to a full hourly index)
+    and the minute loader (which stores the cleaned rows sparse, as-is).
+    """
     # types
     df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
     df = df.dropna(subset=["timestamp"])
@@ -111,7 +116,11 @@ def prepare_dataframe(df, base, quote, symbol, data_start_date, data_end_date):
     end_cutoff = pd.Timestamp(data_end_date)
     df = df[(df["ts"] > start_cutoff) & (df["ts"] <= end_cutoff)]
 
-    df = df.sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
+    return df.sort_values("ts").drop_duplicates(subset=["ts"]).reset_index(drop=True)
+
+
+def prepare_dataframe(df, base, quote, symbol, data_start_date, data_end_date):
+    df = _clean_raw_frame(df, data_start_date, data_end_date)
 
     # full hourly index
     full_index = pd.date_range(

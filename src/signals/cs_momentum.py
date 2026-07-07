@@ -44,11 +44,68 @@ def compute_bar_returns(close_wide, log_returns=True):
     return close_wide.pct_change()
 
 
+def build_traded_mask(df_long, signal_timeframe):
+    """Boolean ts × symbol panel: True where the bar contains >= 1 real trade.
+
+    The hourly loader forward-fills no-trade hours (``volume = 0``,
+    ``trades = 0``), so closes on those bars are stale copies of an older
+    print. Returns computed across a stale endpoint are fictitious and bias
+    short-horizon reversal upward (a stale asset shows 0% while peers move,
+    ranks as a "loser", then mechanically catches up — Lo-MacKinlay
+    non-synchronous trading). At the signal timeframe a bar counts as traded
+    if any underlying hourly row had ``trades > 0``; bins with no rows at all
+    (before listing / after delisting) are False.
+    """
+    if "trades" not in df_long.columns:
+        raise ValueError(
+            "df_long must include a 'trades' column to build the traded mask "
+            "(fetch_ohlcv_long returns it)"
+        )
+    panel = df_long[["ts", "symbol", "trades"]].copy()
+    panel["ts"] = pd.to_datetime(panel["ts"], utc=True)
+    trades_wide = panel.pivot(index="ts", columns="symbol", values="trades").sort_index()
+    trades_sum = trades_wide.resample(signal_timeframe).sum(min_count=1)
+    return trades_sum.gt(0.0) & trades_sum.notna()
+
+
+def apply_traded_mask(panel, traded_mask, lookback_bars=0, forward_bars=0):
+    """NaN out cells whose defining price endpoints fall on stale bars.
+
+    A cell ``(t, s)`` survives only if symbol ``s`` traded at bar ``t``, at
+    ``t - lookback_bars`` (when > 0), and at ``t + forward_bars`` (when > 0).
+    Use ``lookback_bars=R`` for an R-bar feature (both return endpoints must
+    be real prints) and ``forward_bars=H`` for H-bar forward returns (entry
+    and exit prints must be real). Intermediate bars are not required to
+    trade — endpoint returns are unaffected by gaps inside the window.
+    """
+    lookback = int(lookback_bars)
+    forward = int(forward_bars)
+    if lookback < 0 or forward < 0:
+        raise ValueError("lookback_bars and forward_bars must be >= 0")
+    aligned = traded_mask.reindex(
+        index=panel.index, columns=panel.columns, fill_value=False
+    ).astype(bool)
+    valid = aligned
+    if lookback > 0:
+        valid = valid & aligned.shift(lookback, fill_value=False)
+    if forward > 0:
+        valid = valid & aligned.shift(-forward, fill_value=False)
+    return panel.where(valid)
+
+
 def compute_return_horizons(close_wide, horizons, log_returns=True, skip_bars=0):
     """Compute return panels for each horizon in `horizons` bars.
 
     Returns are measured from ``t - skip_bars - horizon`` to ``t - skip_bars``.
     With ``skip_bars=0`` this reduces to standard trailing horizon returns.
+
+    ``skip_bars`` is part of the *alpha definition* (Jegadeesh-Titman skip:
+    exclude the most recent bars' returns because of short-term reversal), not
+    an execution delay — that is `execution_delay_bars` in the backtest, or
+    the minute-level delay in `src.research.execution`. Note the side effect:
+    with ``skip_bars >= 1`` the feature at bar ``t`` only uses closes up to
+    ``t - skip_bars``, so it is fully computable at least one bar before an
+    execution at close(t).
     """
     skip = int(skip_bars)
     if skip < 0:
@@ -223,10 +280,16 @@ def apply_rebalance_decimation(signal_wide, every_n_bars):
     """Hold the signal across multiple signal bars between rebalances.
 
     Samples the signal at every `every_n_bars`th row and forward-fills the held
-    value to the intermediate rows. With `every_n_bars=1` (the default in
-    `build_momentum_signal`), rebalance cadence is locked to `signal_timeframe`
-    and this is a no-op. Larger values let you study turnover sensitivity, e.g.
-    `every_n_bars=3` at a 4h signal cadence rebalances every 12h.
+    value to the intermediate rows. With `every_n_bars=1` this is a no-op.
+
+    This is an **IC-analysis device only**: it answers "what does the signal I
+    would actually be holding predict?" at every bar, with the induced overlap
+    absorbed by a Newey-West lag of ``max(H, every_n_bars) - 1``. It must NOT
+    feed backtests — `run_light_backtest` implements trading cadence itself by
+    stepping the book every `holding_period_bars`, and feeding it a decimated
+    signal layers two cadence mechanisms with phase-dependent staleness.
+    Backtests take the pre-decimation signal (``signal_fresh`` in the pipeline
+    outputs).
     """
     n = int(every_n_bars)
     if n <= 1 or signal_wide.empty:
@@ -340,11 +403,15 @@ def build_selected_momentum_signal(
     universe_mask=None,
     cross_sectional_transform="zscore",
     min_assets_per_timestamp=6,
-    rebalance_every_n_bars=1,
+    ic_rebalance_bars=1,
     apply_xsec_transform=True,
     apply_rebalance_decimation_flag=True,
 ):
-    """Build final signal from a selected raw panel using notebook-style options."""
+    """Build final signal from a selected raw panel using notebook-style options.
+
+    The decimated output is for IC analysis; backtests should use the
+    pre-decimation signal (``apply_rebalance_decimation_flag=False``).
+    """
     signal = apply_universe_mask(raw_panel, universe_mask)
     if apply_xsec_transform:
         signal = cross_sectional_rank_or_zscore(
@@ -353,7 +420,7 @@ def build_selected_momentum_signal(
             min_assets_per_timestamp=min_assets_per_timestamp,
         )
     if apply_rebalance_decimation_flag:
-        signal = apply_rebalance_decimation(signal, rebalance_every_n_bars)
+        signal = apply_rebalance_decimation(signal, ic_rebalance_bars)
     return signal
 
 
@@ -366,14 +433,14 @@ def build_momentum_signal(
     cross_sectional_transform="zscore",
     min_assets_per_timestamp=6,
     log_returns=True,
-    rebalance_every_n_bars=1,
+    ic_rebalance_bars=1,
 ):
     """End-to-end signal construction from long OHLCV rows.
 
-    By default the signal is produced and rebalanced at the cadence given by
-    `signal_timeframe` (one signal per bar, executed at that bar's close).
-    Set `rebalance_every_n_bars` > 1 to rebalance less often than the signal
-    cadence and study the turnover/cost trade-off.
+    ``"signal"`` in the output is decimated by `ic_rebalance_bars` for IC
+    analysis ("what does the held signal predict?"); ``"signal_fresh"`` is the
+    same signal pre-decimation and is what backtests should consume — trading
+    cadence there is `holding_period_bars`, not decimation.
     """
     close_wide = resample_to_signal_timeframe(df_long, signal_timeframe)
     ret_wide = compute_bar_returns(close_wide, log_returns=log_returns)
@@ -390,17 +457,18 @@ def build_momentum_signal(
     )
     if universe_mask is not None:
         raw_signal = raw_signal.where(universe_mask)
-    signal = cross_sectional_rank_or_zscore(
+    signal_fresh = cross_sectional_rank_or_zscore(
         raw_signal,
         method=cross_sectional_transform,
         min_assets_per_timestamp=min_assets_per_timestamp,
     )
-    signal = apply_rebalance_decimation(signal, rebalance_every_n_bars)
+    signal = apply_rebalance_decimation(signal_fresh, ic_rebalance_bars)
 
     return {
         "close_wide": close_wide,
         "return_wide": ret_wide,
         "raw_signal": raw_signal,
         "signal": signal,
+        "signal_fresh": signal_fresh,
         "universe_mask": universe_mask,
     }

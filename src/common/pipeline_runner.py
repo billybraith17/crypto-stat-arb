@@ -9,7 +9,8 @@ from src.common.run_logging import (
     log_pipeline_run,
 )
 from src.data.build_database_from_csv import main as build_database
-from src.data.checks import run_checks
+from src.data.build_minute_database import main as build_minute_database
+from src.data.checks import run_checks, run_minute_checks
 from src.data.warnings import run_warnings
 
 
@@ -34,6 +35,14 @@ def execute_pipeline(engine, settings):
 
         print("\n=== STEP 2: DATA QUALITY CHECKS ===")
         run_checks(engine)
+
+        if settings.get("minute_data_enabled"):
+            print("\n=== STEP 3: BUILD 1-MINUTE DATABASE ===")
+            build_minute_database(engine, settings)
+
+            print("\n=== STEP 4: 1-MINUTE DATA QUALITY CHECKS ===")
+            run_minute_checks(engine, settings)
+
         checks_passed = True
         warnings, _, event_details = run_warnings(engine, settings)
 

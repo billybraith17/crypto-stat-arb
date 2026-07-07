@@ -88,3 +88,49 @@ def universe_df():
             "symbol": ["AAA", "BBB", "AAA", "CCC"],
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# Minute-data fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def minute_exec_closes_long():
+    """Bucketed 1m execution closes as returned by fetch_minute_exec_closes.
+
+    Two symbols over six hourly buckets starting 2023-01-01 00:00 UTC.
+    AAA trades every hour; BBB has an empty bucket at 02:00 (no trades that
+    hour) and no data at all before 01:00, exercising LOCF and leading-NaN
+    behaviour.
+    """
+    hours = _utc_index(6, freq="1h")
+    rows = []
+    for i, ts in enumerate(hours):
+        rows.append({"bucket_ts": ts, "symbol": "AAA", "exec_close": 100.0 + i})
+    for i, ts in enumerate(hours):
+        if i == 0 or i == 2:  # BBB: not yet listed at 00:00, no trades at 02:00
+            continue
+        rows.append({"bucket_ts": ts, "symbol": "BBB", "exec_close": 50.0 + i})
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def sparse_minute_raw_df():
+    """Raw-CSV-shaped minute frame (unix timestamp, OHLCV, trades).
+
+    Contains gaps between trade minutes, one duplicate timestamp, and rows
+    outside the [start, end] cutoff window used in tests.
+    """
+    base_ts = int(pd.Timestamp("2023-01-01 00:00:00", tz="UTC").timestamp())
+    minute_offsets = [-10, 0, 1, 5, 5, 6, 60, 1440, 100000]
+    rows = []
+    for k, off in enumerate(minute_offsets):
+        px = 100.0 + k
+        rows.append(
+            {
+                "timestamp": base_ts + off * 60,
+                "open": px, "high": px + 0.5, "low": px - 0.5, "close": px,
+                "volume": 1.0 + k, "trades": 1 + k,
+            }
+        )
+    return pd.DataFrame(rows)

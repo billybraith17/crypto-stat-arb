@@ -32,7 +32,10 @@ class TestLoadRealConfig:
             "signal_timeframe",
             "momentum_lookback_bars",
             "holding_period_bars",
-            "rebalance_every_n_bars",
+            "ic_rebalance_bars",
+            "use_minute_execution",
+            "execution_delay_minutes",
+            "execution_delay_minutes_grid",
             "execution_delay_bars",
             "log_returns",
             "vol_window_bars",
@@ -150,6 +153,40 @@ class TestValidationGuards:
         p.write_text("reference_base_config: configs/base.yaml\n")
         settings = load_research_settings(str(p))
         assert "signal_timeframe" in settings
+
+    def test_minute_execution_defaults(self, tmp_path):
+        data = {"reference_base_config": "configs/base.yaml"}
+        s = load_research_settings(_write_yaml(tmp_path, data))
+        assert s["use_minute_execution"] is False
+        assert s["execution_delay_minutes"] == 1
+        assert s["execution_delay_minutes_grid"] == [0, 1, 5, 15, 30, 60]
+        assert all(isinstance(x, int) for x in s["execution_delay_minutes_grid"])
+
+    def test_minute_execution_with_bar_delay_raises(self, tmp_path):
+        """Double-delay guard: minute execution embeds the delay in the exec
+        panel, so a bar-level execution delay on top must be rejected."""
+        data = {
+            "reference_base_config": "configs/base.yaml",
+            "use_minute_execution": True,
+            "execution_delay_bars": 1,
+        }
+        with pytest.raises(ValueError, match="double delay"):
+            load_research_settings(_write_yaml(tmp_path, data))
+
+    def test_minute_execution_without_bar_delay_ok(self, tmp_path):
+        data = {
+            "reference_base_config": "configs/base.yaml",
+            "use_minute_execution": True,
+            "execution_delay_bars": 0,
+        }
+        s = load_research_settings(_write_yaml(tmp_path, data))
+        assert s["use_minute_execution"] is True
+
+    def test_real_mean_reversion_config_loads(self):
+        s = load_research_settings("configs/research/mean_reversion_signal.yaml")
+        assert s["use_minute_execution"] is True
+        assert s["execution_delay_bars"] == 0
+        assert s["ic_rebalance_bars"] == 2
 
     def test_overrides_base_config_dates(self, tmp_path):
         data = {

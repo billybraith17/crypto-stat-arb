@@ -1,7 +1,7 @@
 # Cross-Sectional Statistical Arbitrage — Crypto
 
 A research codebase for developing and validating **cross-sectional alpha signals** in
-cryptocurrency markets, using hourly OHLCV data for liquid Kraken USD pairs.
+cryptocurrency markets, using hourly and 1-minute OHLCV data for liquid Kraken USD pairs.
 
 The objective is **not** a single profitable strategy. It is to replicate the research process
 used by systematic trading firms: form a hypothesis, engineer features, turn them into
@@ -50,9 +50,12 @@ Each signal follows the same structured process:
    forward-return and signal-lookback windows.
 6. Analyse quantile monotonicity and long/short portfolio spreads.
 7. Test robustness across lookback, holding period, transform, and universe size.
-8. Stress realistic transaction costs and execution delays.
-9. Check signal stability across sub-periods, with a later block of data kept fully held out for a
-   future out-of-sample test.
+8. Stress realistic transaction costs — including per-asset effective spreads estimated from
+   OHLC ranges — and execution delays.
+9. Judge best-of-grid results as **max-statistics**: max-over-trials p-values and deflated
+   Sharpe ratios, so a winner picked from N trials is never quoted at single-test significance.
+10. Check signal stability with **walk-forward evaluation** over embargoed folds, with a later
+    block of data kept fully held out for a future out-of-sample test.
 
 The emphasis throughout is on avoiding overfitting and preferring robust, interpretable signals.
 
@@ -62,9 +65,12 @@ The emphasis throughout is on avoiding overfitting and preferring robust, interp
 
 ### Data pipeline
 
-Raw Kraken CSVs → **PostgreSQL** (`ohlcv`, `monthly_universe`), with hard data-quality checks,
-soft warning diagnostics, and per-run telemetry. A monthly tradable universe is rebuilt from
-trailing liquidity, with minimum listing-age and liquidity filters.
+Raw Kraken CSVs → **PostgreSQL** (`ohlcv`, `ohlcv_1m`, `monthly_universe`), with hard
+data-quality checks, soft warning diagnostics, and per-run telemetry. A monthly tradable
+universe is rebuilt from trailing liquidity, with minimum listing-age and liquidity filters.
+Alongside the dense hourly table, a **sparse 1-minute table** (real trade bars only, universe
+symbols only) supports minute-level execution modelling, with a cross-timeframe consistency
+check tying the two tables together.
 
 ### Momentum sleeve (`src/signals/cs_momentum.py`)
 
@@ -79,11 +85,23 @@ z-score / Bollinger band-touch, volatility-adjusted moves, extreme-move normalis
 exhaustion, VWAP/MA distance, an RSI proxy, and range position — all sign-normalised so that
 higher always means "buy".
 
-### Evaluation framework (`src/research/momentum_eval.py`)
+### Evaluation framework (`src/research/momentum_eval.py`, `execution.py`, `spreads.py`)
 
 Spearman/rank IC, Newey-West adjusted t-statistics, IC-decay heatmaps, quantile portfolio
-analysis, a cost-aware long/short backtest, execution-delay sensitivity, and sub-period
-(train/test) IC comparison. The same helpers are reused across both sleeves.
+analysis, a cost-aware long/short backtest (flat or per-asset spread costs), execution-delay
+sensitivity, walk-forward IC evaluation with embargoed folds, and selection-bias corrections
+(max-over-trials p-values, deflated Sharpe). The same helpers are reused across both sleeves.
+
+Backtests fill at **real 1-minute closes** a configurable number of minutes after the signal
+bar's close (`src/research/execution.py`), rather than assuming execution at the very close the
+signal was computed on — the delay-sensitivity curve (0–60 minutes) quantifies how much edge
+survives realistic latency, and how much of the naive result was look-ahead.
+
+A set of measurement-integrity guards keeps headline numbers honest: execution fills that are
+not real prints (LOCF-carried) are excluded from backtest returns, forward-filled no-trade bars
+are masked out of the IC analysis to bound the stale-print artifact, and per-asset effective
+spreads estimated from OHLC ranges (Corwin–Schultz, `src/research/spreads.py`) bound how much of
+a short-horizon reversal edge is just bid-ask bounce a taker could never capture.
 
 ---
 
@@ -135,7 +153,7 @@ src/
 ├── common/     # config loading, DB engine, pipeline runner, run logging
 ├── data/       # CSV → PostgreSQL loader, quality checks, DB-to-research accessors
 ├── signals/    # cross-sectional momentum & mean-reversion signal construction
-└── research/   # evaluation helpers (IC, quantiles, light backtest)
+└── research/   # evaluation helpers (IC, quantiles, backtest, execution fills, spreads)
 tests/          # unit tests + data-quality integration checks
 run_pipeline.py # pipeline entry point
 ```

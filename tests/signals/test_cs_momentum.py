@@ -467,7 +467,8 @@ class TestBuildMomentumSignal:
             momentum_lookback_bars=2,
         )
         assert set(result.keys()) == {
-            "close_wide", "return_wide", "raw_signal", "signal", "universe_mask"
+            "close_wide", "return_wide", "raw_signal", "signal", "signal_fresh",
+            "universe_mask",
         }
 
     def test_signal_shape_matches_close_wide(self, long_panel_df):
@@ -524,6 +525,7 @@ class TestBuildFeaturePanels:
         out = build_feature_panels(
             close_wide=multi_symbol_close_wide,
             horizons=[2],
+            benchmark_symbol="AAA",
             log_returns=True,
             skip_bars=1,
         )

@@ -1,8 +1,10 @@
 reference_base_config: configs/base.yaml
 
 # Timeframe and trading-cadence controls.
+# holding_period_bars is the single trading-cadence knob for backtests;
+# ic_rebalance_bars decimates the signal for IC analysis only.
 signal_timeframe: 24h
-rebalance_every_n_bars: 1
+ic_rebalance_bars: 1
 holding_period_bars: 20
 execution_delay_bars: 0
 

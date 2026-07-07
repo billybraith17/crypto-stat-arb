@@ -27,9 +27,18 @@ def load_research_settings(config_path, base_config_path=None):
     settings.update(
         {
             "signal_timeframe": str(cfg.get("signal_timeframe", "4h")),
-            "rebalance_every_n_bars": int(cfg.get("rebalance_every_n_bars", 1)),
+            # Decimation cadence for IC analysis only — backtests always use
+            # the pre-decimation signal with holding_period_bars as cadence.
+            "ic_rebalance_bars": int(cfg.get("ic_rebalance_bars", 1)),
             "holding_period_bars": int(cfg.get("holding_period_bars", 1)),
             "execution_delay_bars": int(cfg.get("execution_delay_bars", 0)),
+            # Minute-level execution modelling (entry/exit at signal close
+            # + delta minutes, priced from the sparse ohlcv_1m table).
+            "use_minute_execution": bool(cfg.get("use_minute_execution", False)),
+            "execution_delay_minutes": int(cfg.get("execution_delay_minutes", 1)),
+            "execution_delay_minutes_grid": list(
+                cfg.get("execution_delay_minutes_grid", [0, 1, 5, 15, 30, 60])
+            ),
             "momentum_lookback_bars": int(cfg.get("momentum_lookback_bars", 6)),
             "momentum_skip_bars": int(cfg.get("momentum_skip_bars", 0)),
             "log_returns": bool(cfg.get("log_returns", True)),
@@ -86,6 +95,13 @@ def load_research_settings(config_path, base_config_path=None):
             f"got {settings['residual_space']!r}"
         )
 
+    if settings["use_minute_execution"] and settings["execution_delay_bars"] > 0:
+        raise ValueError(
+            "use_minute_execution embeds the delay in the execution close "
+            "panel; execution_delay_bars must stay 0 to avoid a double delay "
+            f"(got execution_delay_bars={settings['execution_delay_bars']})"
+        )
+
     if settings["max_assets"] is not None:
         settings["max_assets"] = int(settings["max_assets"])
     settings["feature_horizons_bars"] = [int(x) for x in settings["feature_horizons_bars"]]
@@ -96,5 +112,8 @@ def load_research_settings(config_path, base_config_path=None):
     settings["holding_period_grid_bars"] = [int(x) for x in settings["holding_period_grid_bars"]]
     settings["universe_top_n_grid"] = [int(x) for x in settings["universe_top_n_grid"]]
     settings["cost_stress_multipliers"] = [float(x) for x in settings["cost_stress_multipliers"]]
+    settings["execution_delay_minutes_grid"] = [
+        int(x) for x in settings["execution_delay_minutes_grid"]
+    ]
 
     return settings

@@ -7,6 +7,13 @@ raw_dir: src/data/raw/master_q4.nosync
 data_start_date: 2020-09-30 23:59:59+00:00
 data_end_date: 2025-12-31 23:59:59+00:00
 
+# 1-minute execution data (sparse ohlcv_1m table, universe symbols only).
+minute_data_enabled: true
+minute_timeframe_minutes: 1
+minute_reload_mode: if_empty        # if_empty | replace
+minute_consistency_sample_symbols: 5
+minute_consistency_rel_tol: 1.0e-6
+
 warning_thresholds:
   extreme_return_abs: 0.2
   large_symbol_gap_hours: 1.0
