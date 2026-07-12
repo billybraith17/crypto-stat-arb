@@ -224,6 +224,147 @@ def build_vol_adjusted_features(return_wide, vol_window_bars=24):
     }
 
 
+def build_market_index_returns(
+    return_wide,
+    mode="equal_weight",
+    benchmark_symbol="XBT/USD",
+    universe_mask=None,
+    min_assets=1,
+):
+    """Market return series used for beta estimation and residualization.
+
+    ``mode="equal_weight"`` (default): per-bar mean of ``return_wide`` across
+    universe members (all non-NaN symbols when ``universe_mask`` is None);
+    bars with fewer than ``min_assets`` valid members are NaN. Pass a return
+    panel already NaN-masked for non-traded bars (``apply_traded_mask``) so
+    stale forward-filled prints do not drag the index toward zero. Note the
+    ~1/N self-inclusion bias: each asset is one N-th of its own regressor,
+    pulling its estimated beta toward 1 by roughly 1/N; a leave-one-out index
+    is a possible refinement, not implemented here.
+
+    ``mode="benchmark"``: the benchmark symbol's own return column. Beware the
+    downstream degeneracy: the benchmark's residual return is then identically
+    ~0, parking it mid-rank in every residual-momentum feature.
+    """
+    mode = str(mode).lower()
+    if mode not in ("equal_weight", "benchmark"):
+        raise ValueError("mode must be 'equal_weight' or 'benchmark'")
+    if int(min_assets) < 1:
+        raise ValueError("min_assets must be >= 1")
+
+    if mode == "benchmark":
+        if benchmark_symbol not in return_wide.columns:
+            sample = list(return_wide.columns)[:6]
+            raise KeyError(
+                f"benchmark_symbol '{benchmark_symbol}' not found in panel columns "
+                f"(sample: {sample}). Check that the ticker matches the database "
+                f"(Kraken stores Bitcoin as XBT/USD, not BTC/USD)."
+            )
+        return return_wide[benchmark_symbol].rename("market_ret")
+
+    working = return_wide
+    if universe_mask is not None:
+        mask = universe_mask.reindex(index=working.index, columns=working.columns)
+        mask = mask.fillna(False).astype(bool)
+        working = working.where(mask)
+    n_valid = working.notna().sum(axis=1)
+    market = working.mean(axis=1).where(n_valid >= int(min_assets))
+    return market.rename("market_ret")
+
+
+def estimate_rolling_betas(
+    return_wide,
+    market_returns,
+    window_bars=90,
+    min_periods=None,
+    shrinkage=0.0,
+    shrink_target=1.0,
+):
+    """Trailing beta of each symbol against a market return series.
+
+    ``beta_raw[t, s] = Cov_w(r_s, m) / Var_w(m)`` over the trailing
+    ``window_bars`` bars ending at ``t`` inclusive — the same
+    "uses data through t only" convention as ``rolling_momentum_score``, so a
+    beta at bar ``t`` is legitimate input to a weight executed at close(t).
+    Windows where the market variance is 0 return NaN (not inf). NaN returns
+    (e.g. traded-mask holes, pre-listing history) are excluded pairwise: the
+    market variance for symbol ``s`` is computed only over bars where ``s``
+    itself is valid, so covariance and variance always share the same sample
+    (otherwise a hole would bias the ratio). ``min_periods`` defaults to the
+    full window (strict).
+
+    ``shrinkage`` pulls the raw estimate linearly toward ``shrink_target``:
+    ``beta = (1 - shrinkage) * beta_raw + shrinkage * shrink_target``. With
+    ~90 observations per window the raw estimator is noisy; shrinking toward
+    1 (liquid crypto is roughly a unit-beta asset class) trades a small bias
+    for a much lower-variance hedge ratio.
+    """
+    window = int(window_bars)
+    if window <= 1:
+        raise ValueError("window_bars must be > 1")
+    mp = window if min_periods is None else int(min_periods)
+    if mp < 2 or mp > window:
+        raise ValueError("min_periods must be in [2, window_bars]")
+    lam = float(shrinkage)
+    if not 0.0 <= lam <= 1.0:
+        raise ValueError("shrinkage must be in [0, 1]")
+
+    market = market_returns.reindex(return_wide.index)
+    cov = return_wide.rolling(window, min_periods=mp).cov(market)
+    # Per-symbol market variance over the pairwise-valid sample only.
+    market_masked = pd.DataFrame(
+        np.where(return_wide.notna(), market.to_numpy()[:, None], np.nan),
+        index=return_wide.index,
+        columns=return_wide.columns,
+    )
+    var = market_masked.rolling(window, min_periods=mp).var()
+    beta_raw = cov / var.replace(0.0, np.nan)
+    return (1.0 - lam) * beta_raw + lam * float(shrink_target)
+
+
+def build_residual_return_panel(return_wide, betas, market_returns):
+    """Beta-residualized returns: ``eps[t, s] = r[t, s] - beta[t, s] * m[t]``.
+
+    NaN in the return, the beta, or the market return propagates to NaN, so
+    beta warm-up rows and traded-mask holes drop out of downstream
+    ``min_periods`` windows instead of being silently treated as zero.
+    """
+    betas_aligned = betas.reindex(index=return_wide.index, columns=return_wide.columns)
+    market = market_returns.reindex(return_wide.index)
+    return return_wide - betas_aligned.mul(market, axis=0)
+
+
+def build_residual_momentum_features(residual_return_wide, horizons, skip_bars=0):
+    """Residual-momentum family (Blitz/Huij/Martens 2011) per horizon.
+
+    For each horizon ``h``, with the same Jegadeesh-Titman ``skip_bars``
+    convention as ``rolling_momentum_score``:
+
+    - ``residual_momentum``: sum of the trailing ``h`` residual bar returns.
+    - ``residual_momentum_scaled``: that sum divided by the rolling std
+      (population, ``ddof=0``) of the same residuals — the standardized
+      variant that carries most of the documented improvement in equities.
+      The per-asset scaling reweights assets even though a cross-sectional
+      transform follows, because it changes relative magnitudes within a row.
+    """
+    skip = int(skip_bars)
+    if skip < 0:
+        raise ValueError("skip_bars must be >= 0")
+    features = {}
+    for horizon in horizons:
+        h = int(horizon)
+        if h <= 0:
+            raise ValueError("All horizons must be > 0")
+        working = residual_return_wide.shift(skip)
+        resid_sum = working.rolling(h, min_periods=h).sum()
+        resid_std = working.rolling(h, min_periods=h).std(ddof=0)
+        features[h] = {
+            "residual_momentum": resid_sum,
+            "residual_momentum_scaled": resid_sum.div(resid_std.replace(0.0, np.nan)),
+        }
+    return features
+
+
 def build_monthly_universe_mask(index, columns, universe_df):
     """Build a timestamp x symbol boolean mask from monthly universe rows."""
     if universe_df is None:
@@ -317,8 +458,25 @@ def build_feature_panels(
     residual_space="log",
     universe_mask=None,
     skip_bars=0,
+    beta_panel=None,
+    market_returns=None,
 ):
-    """Build core, relative, and volatility-adjusted momentum feature families."""
+    """Build core, relative, and volatility-adjusted momentum feature families.
+
+    When ``beta_panel`` and ``market_returns`` are both provided (they must be
+    passed together), a fourth ``"residual_features"`` family is added:
+    momentum on beta-residualized *bar* returns
+    (``build_residual_return_panel`` + ``build_residual_momentum_features``),
+    generalizing the static beta=1 ``minus_benchmark`` residual to
+    estimated-beta residuals. Estimate the betas and market index on
+    traded-masked returns (``apply_traded_mask``) so stale prints don't bias
+    them; the residual formation itself uses raw bar returns from
+    ``close_wide``, consistent with the other families. When neither is
+    passed, the output is identical to the three-family version.
+    """
+    if (beta_panel is None) != (market_returns is None):
+        raise ValueError("beta_panel and market_returns must be provided together")
+
     core_returns = compute_return_horizons(
         close_wide, horizons=horizons, log_returns=log_returns, skip_bars=skip_bars
     )
@@ -335,11 +493,20 @@ def build_feature_panels(
         vol_adjusted_features[horizon] = build_vol_adjusted_features(
             ret_wide, vol_window_bars=vol_window_bars
         )
-    return {
+    feature_pack = {
         "core_returns": core_returns,
         "relative_features": relative_features,
         "vol_adjusted_features": vol_adjusted_features,
     }
+    if beta_panel is not None:
+        bar_returns = compute_bar_returns(close_wide, log_returns=log_returns)
+        residual_returns = build_residual_return_panel(
+            bar_returns, betas=beta_panel, market_returns=market_returns
+        )
+        feature_pack["residual_features"] = build_residual_momentum_features(
+            residual_returns, horizons=horizons, skip_bars=skip_bars
+        )
+    return feature_pack
 
 
 def apply_universe_mask(panel, universe_mask):
@@ -357,6 +524,7 @@ def select_momentum_feature_panel(
     feature_horizon=None,
     relative_feature="minus_xsec_mean",
     vol_feature="zscored_return",
+    residual_feature="residual_momentum_scaled",
 ):
     """Select one momentum feature panel (or baseline signal) for diagnostics."""
     family = str(feature_family).lower()
@@ -393,8 +561,22 @@ def select_momentum_feature_panel(
             )
         return vol_panels[vol_feature], f"{vol_feature}_{h}bar"
 
+    if family == "residual":
+        if "residual_features" not in feature_pack:
+            raise ValueError(
+                "feature_pack has no 'residual_features' — rebuild it with "
+                "build_feature_panels(..., beta_panel=..., market_returns=...)"
+            )
+        resid_panels = feature_pack["residual_features"][h]
+        if residual_feature not in resid_panels:
+            raise ValueError(
+                "residual_feature must be one of "
+                f"{list(resid_panels.keys())}, got {residual_feature!r}"
+            )
+        return resid_panels[residual_feature], f"{residual_feature}_{h}bar"
+
     raise ValueError(
-        "feature_family must be one of: baseline, core, relative, vol_adjusted"
+        "feature_family must be one of: baseline, core, relative, vol_adjusted, residual"
     )
 
 

@@ -187,6 +187,46 @@ class TestValidationGuards:
         assert s["use_minute_execution"] is True
         assert s["execution_delay_bars"] == 0
         assert s["ic_rebalance_bars"] == 2
+        assert s["beta_window_bars"] == 720
+
+    def test_beta_defaults_when_yaml_omits(self, tmp_path):
+        data = {"reference_base_config": "configs/base.yaml"}
+        s = load_research_settings(_write_yaml(tmp_path, data))
+        assert s["market_index_mode"] == "equal_weight"
+        assert s["beta_window_bars"] == 90
+        assert s["beta_min_periods_bars"] is None
+        assert s["beta_shrinkage"] == 0.2
+        assert s["beta_shrink_target"] == 1.0
+        assert s["beta_hedge_enabled"] is False
+        assert s["max_hedge_weight"] is None
+
+    def test_beta_optional_knobs_cast_when_set(self, tmp_path):
+        data = {
+            "reference_base_config": "configs/base.yaml",
+            "beta_min_periods_bars": 45,
+            "max_hedge_weight": 1,
+        }
+        s = load_research_settings(_write_yaml(tmp_path, data))
+        assert s["beta_min_periods_bars"] == 45
+        assert isinstance(s["beta_min_periods_bars"], int)
+        assert s["max_hedge_weight"] == 1.0
+        assert isinstance(s["max_hedge_weight"], float)
+
+    def test_raises_on_invalid_market_index_mode(self, tmp_path):
+        data = {
+            "reference_base_config": "configs/base.yaml",
+            "market_index_mode": "cap_weight",
+        }
+        with pytest.raises(ValueError, match="market_index_mode"):
+            load_research_settings(_write_yaml(tmp_path, data))
+
+    def test_raises_on_out_of_range_beta_shrinkage(self, tmp_path):
+        data = {
+            "reference_base_config": "configs/base.yaml",
+            "beta_shrinkage": 1.5,
+        }
+        with pytest.raises(ValueError, match="beta_shrinkage"):
+            load_research_settings(_write_yaml(tmp_path, data))
 
     def test_overrides_base_config_dates(self, tmp_path):
         data = {

@@ -38,6 +38,17 @@ benchmark_symbol: XBT/USD
 # Relative residuals: "log" (same units as core returns) or "simple" (P&L-aligned).
 residual_space: log
 
+# Market-beta neutrality (diagnostics only for this sleeve). Betas are
+# trailing Cov/Var vs the equal-weight universe index, shrunk toward 1.
+# 720 bars at 1h = 30 days of history per estimate.
+market_index_mode: equal_weight
+beta_window_bars: 720
+beta_min_periods_bars: null
+beta_shrinkage: 0.2
+beta_shrink_target: 1.0
+beta_hedge_enabled: false
+max_hedge_weight: null
+
 # Feature families to compare (in signal bars).
 # [1, 2, 4, 6] = [4h, 8h, 16h, 24h] at 4h cadence — short-term reversals.
 feature_horizons_bars: [1, 2, 4, 6]

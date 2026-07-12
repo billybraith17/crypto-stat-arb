@@ -322,6 +322,7 @@ def run_light_backtest(
     returns_are_log=False,
     holding_period_bars=1,
     periods_per_year=None,
+    weights_wide=None,
 ):
     """Backtest equal-weight top/bottom quantile portfolio with simple costs.
 
@@ -355,12 +356,24 @@ def run_light_backtest(
     understate costs on the illiquid tail of the universe. Symbols missing
     from the Series (or NaN) are filled with the cross-sectional median of
     the supplied values; pass explicit values to override.
+
+    ``weights_wide`` bypasses the internal quantile construction and backtests
+    an externally built book (e.g. ``build_beta_hedged_weights`` output) under
+    the identical delay / H-stepping / turnover / cost accounting —
+    ``signal_wide`` may then be None and ``top_quantile``/``bottom_quantile``
+    are ignored. Pass weights indexed like the signal would be: the same
+    ``execution_delay_bars`` shift is applied.
     """
     H = max(int(holding_period_bars), 1)
 
-    weights = build_quantile_weights(
-        signal_wide, top_quantile=top_quantile, bottom_quantile=bottom_quantile
-    )
+    if weights_wide is not None:
+        weights = weights_wide
+    elif signal_wide is not None:
+        weights = build_quantile_weights(
+            signal_wide, top_quantile=top_quantile, bottom_quantile=bottom_quantile
+        )
+    else:
+        raise ValueError("pass either signal_wide or weights_wide")
     delay = int(execution_delay_bars)
     if delay > 0:
         weights = weights.shift(delay)
@@ -410,6 +423,7 @@ def run_light_backtest(
     net_ret = net_ret[valid]
     turnover = turnover[valid]
     costs = costs[valid]
+    gross_exposure = weights_step.fillna(0.0).abs().sum(axis=1)[valid]
 
     cum_gross = (1.0 + gross_ret).cumprod()
     cum_net = (1.0 + net_ret).cumprod()
@@ -440,6 +454,9 @@ def run_light_backtest(
                 float(turnover.mean() * ppy) if len(turnover) else np.nan
             ),
             "mean_cost_per_period": float(costs.mean()) if len(costs) else np.nan,
+            "mean_gross_exposure": (
+                float(gross_exposure.mean()) if len(gross_exposure) else np.nan
+            ),
             "step_bars": int(H),
             "n_periods": int(len(net_ret)),
         },
@@ -531,6 +548,141 @@ def market_correlation(series, benchmark):
     if aligned.empty:
         return np.nan
     return float(aligned["x"].corr(aligned["y"]))
+
+
+# ---------------------------------------------------------------------------
+# Market-beta exposure and hedging
+# ---------------------------------------------------------------------------
+
+
+def portfolio_beta_series(weights, betas):
+    """Ex-ante portfolio beta and how much of the book it is measured on.
+
+    ``portfolio_beta[t] = sum_s w[t, s] * beta[t, s]`` over positions with a
+    valid beta; ``beta_coverage[t]`` is the share of gross exposure
+    ``sum_s |w[t, s]|`` those positions represent. Coverage < 1 means the
+    beta (and any hedge sized from it) ignores part of the book — surface it
+    instead of letting missing betas silently read as "no exposure".
+
+    Dollar neutrality (``sum w = 0``) does not imply ``portfolio_beta = 0``:
+    equal-weight long/short sleeves are beta-neutral only if both sleeves
+    carry the same average beta, which a momentum sort systematically
+    violates (winners in a rally are the high-beta names).
+    """
+    betas_aligned = betas.reindex(index=weights.index, columns=weights.columns)
+    portfolio_beta = weights.mul(betas_aligned).sum(axis=1, min_count=1)
+    abs_w = weights.abs()
+    gross = abs_w.sum(axis=1)
+    covered = abs_w.where(betas_aligned.notna(), 0.0).sum(axis=1)
+    coverage = covered.div(gross.replace(0.0, np.nan))
+    return pd.DataFrame(
+        {"portfolio_beta": portfolio_beta, "beta_coverage": coverage}
+    )
+
+
+def realized_beta_diagnostics(
+    strategy_returns,
+    market_returns,
+    rolling_window=20,
+    min_regime_obs=10,
+):
+    """Realized beta of strategy P&L vs the market, full-sample and by regime.
+
+    Returns a dict with the full-sample beta/correlation, up-market and
+    down-market betas (``Cov/Var`` over the ``m > 0`` / ``m < 0`` subsamples,
+    NaN when a regime has fewer than ``min_regime_obs`` points, with counts
+    always reported), and a rolling-beta series. A dollar-neutral book can
+    print a full-sample correlation near 0 while carrying large
+    opposite-signed betas in up and down regimes — the regime split is the
+    statistic that exposes it. On stepped H-bar P&L the sample is small
+    (correlation SE ~ 1/sqrt(n)); read point estimates alongside ``n_obs``.
+    """
+    aligned = pd.concat(
+        [strategy_returns.rename("s"), market_returns.rename("m")], axis=1
+    ).dropna()
+
+    def _beta(frame):
+        if len(frame) < 2:
+            return np.nan
+        var = frame["m"].var()
+        if not np.isfinite(var) or var == 0:
+            return np.nan
+        return float(frame["s"].cov(frame["m"]) / var)
+
+    up = aligned[aligned["m"] > 0]
+    down = aligned[aligned["m"] < 0]
+    min_regime = int(min_regime_obs)
+    window = int(rolling_window)
+    rolling_beta = (
+        aligned["s"].rolling(window, min_periods=window).cov(aligned["m"])
+        / aligned["m"].rolling(window, min_periods=window).var().replace(0.0, np.nan)
+    )
+    return {
+        "n_obs": int(len(aligned)),
+        "beta_full": _beta(aligned),
+        "corr_full": (
+            float(aligned["s"].corr(aligned["m"])) if len(aligned) >= 2 else np.nan
+        ),
+        "n_up": int(len(up)),
+        "n_down": int(len(down)),
+        "beta_up": _beta(up) if len(up) >= min_regime else np.nan,
+        "beta_down": _beta(down) if len(down) >= min_regime else np.nan,
+        "rolling_beta": rolling_beta.rename("rolling_beta"),
+    }
+
+
+def build_beta_hedged_weights(
+    weights,
+    betas,
+    benchmark_symbol="XBT/USD",
+    missing_beta_fill=1.0,
+    max_hedge_weight=None,
+):
+    """Overlay a benchmark position that cancels the ex-ante portfolio beta.
+
+    ``hedge[t] = -portfolio_beta[t] / beta_benchmark[t]`` is **added** to the
+    ``benchmark_symbol`` column (created if absent), so an existing benchmark
+    quantile position and the hedge net into a single position — one turnover
+    charge, which is the correct portfolio accounting. The result is
+    beta-neutral instead of dollar-neutral (row sums are no longer 0), and
+    gross exposure becomes ``2 + |hedge|``; ``run_light_backtest`` reports it
+    as ``mean_gross_exposure``.
+
+    Held positions with a missing beta are filled with ``missing_beta_fill``
+    (default 1.0 — the sane crypto prior). This fill is deliberate, not
+    silent: check ``beta_coverage`` from ``portfolio_beta_series`` before
+    trusting the hedge. ``max_hedge_weight`` optionally clips the hedge to
+    ``±max_hedge_weight`` (beta noise at short windows can size absurd
+    hedges).
+
+    Betas here are estimated on log bar returns while backtest P&L compounds
+    simple returns; at daily bars the mismatch is second-order and accepted
+    as light-backtest scope.
+    """
+    fill = float(missing_beta_fill)
+    betas_aligned = betas.reindex(index=weights.index, columns=weights.columns)
+    held = weights.fillna(0.0) != 0.0
+    betas_filled = betas_aligned.where(~held | betas_aligned.notna(), fill)
+    beta_p = weights.mul(betas_filled).sum(axis=1, min_count=1)
+
+    if benchmark_symbol in betas.columns:
+        beta_bench = betas[benchmark_symbol].reindex(weights.index)
+    else:
+        beta_bench = pd.Series(np.nan, index=weights.index)
+    beta_bench = beta_bench.fillna(fill).replace(0.0, np.nan)
+
+    hedge = -beta_p.div(beta_bench)
+    if max_hedge_weight is not None:
+        cap = float(max_hedge_weight)
+        if cap <= 0:
+            raise ValueError("max_hedge_weight must be > 0")
+        hedge = hedge.clip(-cap, cap)
+
+    hedged = weights.copy()
+    if benchmark_symbol not in hedged.columns:
+        hedged[benchmark_symbol] = 0.0
+    hedged[benchmark_symbol] = hedged[benchmark_symbol].fillna(0.0) + hedge.fillna(0.0)
+    return hedged
 
 
 # ---------------------------------------------------------------------------

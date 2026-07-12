@@ -13,16 +13,21 @@ from src.signals.cs_momentum import (
     _validate_long_panel,
     apply_rebalance_decimation,
     build_feature_panels,
+    build_market_index_returns,
     build_momentum_signal,
     build_monthly_universe_mask,
     build_relative_momentum_features,
+    build_residual_momentum_features,
+    build_residual_return_panel,
     build_vol_adjusted_features,
     compute_bar_returns,
     compute_forward_returns,
     compute_return_horizons,
     cross_sectional_rank_or_zscore,
+    estimate_rolling_betas,
     resample_to_signal_timeframe,
     rolling_momentum_score,
+    select_momentum_feature_panel,
 )
 
 
@@ -535,3 +540,297 @@ class TestBuildFeaturePanels:
             expected.fillna(0).values,
             atol=1e-12,
         )
+
+    def test_no_residual_family_without_beta_args(self, multi_symbol_close_wide):
+        out = build_feature_panels(
+            close_wide=multi_symbol_close_wide,
+            horizons=[2],
+            benchmark_symbol="AAA",
+        )
+        assert "residual_features" not in out
+        assert set(out.keys()) == {
+            "core_returns", "relative_features", "vol_adjusted_features",
+        }
+
+    def test_residual_family_added_with_beta_args(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        market = build_market_index_returns(ret_wide)
+        betas = pd.DataFrame(
+            1.0, index=ret_wide.index, columns=ret_wide.columns
+        )
+        out = build_feature_panels(
+            close_wide=multi_symbol_close_wide,
+            horizons=[2],
+            benchmark_symbol="AAA",
+            beta_panel=betas,
+            market_returns=market,
+        )
+        assert set(out["residual_features"][2].keys()) == {
+            "residual_momentum", "residual_momentum_scaled",
+        }
+        # Legacy families are unchanged by the residual addition.
+        legacy = build_feature_panels(
+            close_wide=multi_symbol_close_wide, horizons=[2], benchmark_symbol="AAA"
+        )
+        pd.testing.assert_frame_equal(
+            out["core_returns"][2], legacy["core_returns"][2]
+        )
+
+    def test_raises_when_only_one_beta_arg_passed(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        with pytest.raises(ValueError, match="provided together"):
+            build_feature_panels(
+                close_wide=multi_symbol_close_wide,
+                horizons=[2],
+                benchmark_symbol="AAA",
+                market_returns=build_market_index_returns(ret_wide),
+            )
+
+
+# ---------------------------------------------------------------------------
+# build_market_index_returns
+# ---------------------------------------------------------------------------
+
+class TestBuildMarketIndexReturns:
+    def test_equal_weight_on_identical_returns(self, simple_close_wide):
+        ret_wide = compute_bar_returns(simple_close_wide, log_returns=True)
+        market = build_market_index_returns(ret_wide)
+        # All symbols double every bar, so the index return is exactly ln(2).
+        assert np.allclose(market.iloc[1:].values, np.log(2.0), atol=1e-12)
+        assert np.isnan(market.iloc[0])
+
+    def test_benchmark_mode_returns_that_column(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        market = build_market_index_returns(
+            ret_wide, mode="benchmark", benchmark_symbol="BBB"
+        )
+        assert np.allclose(
+            market.fillna(0).values, ret_wide["BBB"].fillna(0).values, atol=1e-15
+        )
+
+    def test_universe_mask_restricts_mean(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        mask = pd.DataFrame(False, index=ret_wide.index, columns=ret_wide.columns)
+        mask[["AAA", "BBB"]] = True
+        market = build_market_index_returns(ret_wide, universe_mask=mask)
+        expected = ret_wide[["AAA", "BBB"]].mean(axis=1)
+        assert np.allclose(
+            market.fillna(0).values, expected.fillna(0).values, atol=1e-15
+        )
+
+    def test_min_assets_nans_sparse_rows(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        sparse = ret_wide.copy()
+        sparse.iloc[3, 1:] = np.nan  # leave one valid symbol at bar 3
+        market = build_market_index_returns(sparse, min_assets=2)
+        assert np.isnan(market.iloc[3])
+        assert not np.isnan(market.iloc[4])
+
+    def test_raises_on_missing_benchmark(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        with pytest.raises(KeyError, match="XBT/USD"):
+            build_market_index_returns(ret_wide, mode="benchmark")
+
+    def test_raises_on_invalid_mode(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        with pytest.raises(ValueError, match="mode must be"):
+            build_market_index_returns(ret_wide, mode="cap_weight")
+
+
+# ---------------------------------------------------------------------------
+# estimate_rolling_betas
+# ---------------------------------------------------------------------------
+
+def _beta_test_panel():
+    """8-bar market series with three assets of known beta.
+
+    AAA equals the market (beta 1), BBB is 2x the market (beta 2), CCC is the
+    market plus a constant (beta 1 — adding a constant changes neither the
+    covariance nor the variance).
+    """
+    idx = pd.date_range("2023-01-01", periods=8, freq="1D", tz="UTC")
+    m = pd.Series([0.01, -0.02, 0.03, -0.01, 0.02, -0.03, 0.01, 0.02], index=idx)
+    ret_wide = pd.DataFrame(
+        {"AAA": m, "BBB": 2.0 * m, "CCC": m + 0.005}, index=idx
+    )
+    return ret_wide, m
+
+
+class TestEstimateRollingBetas:
+    def test_known_betas_recovered_exactly(self):
+        ret_wide, m = _beta_test_panel()
+        betas = estimate_rolling_betas(ret_wide, m, window_bars=4)
+        valid = betas.iloc[3:]
+        assert np.allclose(valid["AAA"].values, 1.0, atol=1e-12)
+        assert np.allclose(valid["BBB"].values, 2.0, atol=1e-12)
+        assert np.allclose(valid["CCC"].values, 1.0, atol=1e-12)
+
+    def test_first_window_minus_one_rows_nan(self):
+        ret_wide, m = _beta_test_panel()
+        betas = estimate_rolling_betas(ret_wide, m, window_bars=4)
+        assert betas.iloc[:3].isna().all().all()
+
+    def test_shrinkage_pulls_toward_target(self):
+        ret_wide, m = _beta_test_panel()
+        betas = estimate_rolling_betas(
+            ret_wide, m, window_bars=4, shrinkage=0.5, shrink_target=1.0
+        )
+        # BBB raw beta 2.0 -> 0.5*2.0 + 0.5*1.0 = 1.5
+        assert np.allclose(betas["BBB"].iloc[3:].values, 1.5, atol=1e-12)
+        assert np.allclose(betas["AAA"].iloc[3:].values, 1.0, atol=1e-12)
+
+    def test_zero_variance_market_gives_nan_not_inf(self):
+        idx = pd.date_range("2023-01-01", periods=6, freq="1D", tz="UTC")
+        m = pd.Series(0.01, index=idx)  # constant market
+        ret_wide = pd.DataFrame({"AAA": np.linspace(0.0, 0.05, 6)}, index=idx)
+        betas = estimate_rolling_betas(ret_wide, m, window_bars=3)
+        assert betas["AAA"].isna().all()
+        assert not np.isinf(betas["AAA"].fillna(0.0)).any()
+
+    def test_nan_return_blocks_strict_window(self):
+        ret_wide, m = _beta_test_panel()
+        holed = ret_wide.copy()
+        holed.loc[holed.index[4], "AAA"] = np.nan  # traded-mask hole
+        strict = estimate_rolling_betas(holed, m, window_bars=4)
+        # Windows covering the hole (bars 4..7) lack a full set of pairs.
+        assert strict["AAA"].iloc[4:8].isna().all()
+        relaxed = estimate_rolling_betas(holed, m, window_bars=4, min_periods=3)
+        assert np.allclose(relaxed["AAA"].iloc[4:8].dropna().values, 1.0, atol=1e-12)
+
+    def test_raises_on_bad_params(self):
+        ret_wide, m = _beta_test_panel()
+        with pytest.raises(ValueError, match="window_bars"):
+            estimate_rolling_betas(ret_wide, m, window_bars=1)
+        with pytest.raises(ValueError, match="shrinkage"):
+            estimate_rolling_betas(ret_wide, m, window_bars=4, shrinkage=1.5)
+        with pytest.raises(ValueError, match="min_periods"):
+            estimate_rolling_betas(ret_wide, m, window_bars=4, min_periods=1)
+
+
+# ---------------------------------------------------------------------------
+# build_residual_return_panel
+# ---------------------------------------------------------------------------
+
+class TestBuildResidualReturnPanel:
+    def test_residual_is_alpha_for_known_beta(self):
+        ret_wide, m = _beta_test_panel()
+        alpha = pd.DataFrame(
+            {"AAA": 0.0, "BBB": 0.0, "CCC": 0.005},
+            index=ret_wide.index,
+        )
+        betas = pd.DataFrame(
+            {"AAA": 1.0, "BBB": 2.0, "CCC": 1.0}, index=ret_wide.index
+        )
+        resid = build_residual_return_panel(ret_wide, betas, m)
+        assert np.allclose(resid.values, alpha.values, atol=1e-15)
+
+    def test_nan_beta_propagates(self):
+        ret_wide, m = _beta_test_panel()
+        betas = pd.DataFrame(1.0, index=ret_wide.index, columns=ret_wide.columns)
+        betas.loc[betas.index[2], "AAA"] = np.nan
+        resid = build_residual_return_panel(ret_wide, betas, m)
+        assert np.isnan(resid.loc[resid.index[2], "AAA"])
+        assert not np.isnan(resid.loc[resid.index[2], "BBB"])
+
+
+# ---------------------------------------------------------------------------
+# build_residual_momentum_features
+# ---------------------------------------------------------------------------
+
+class TestBuildResidualMomentumFeatures:
+    def test_constant_residual_sums_and_scaled_nan(self):
+        idx = pd.date_range("2023-01-01", periods=6, freq="1D", tz="UTC")
+        resid = pd.DataFrame({"AAA": 0.01}, index=idx)
+        feats = build_residual_momentum_features(resid, horizons=[3])
+        # h-bar sum of a constant c is exactly h*c ...
+        assert np.allclose(
+            feats[3]["residual_momentum"].iloc[2:].values, 0.03, atol=1e-15
+        )
+        # ... and the rolling std is 0, so the scaled variant is NaN, not inf.
+        assert feats[3]["residual_momentum_scaled"].isna().all().all()
+
+    def test_scaled_matches_hand_computation(self):
+        idx = pd.date_range("2023-01-01", periods=5, freq="1D", tz="UTC")
+        vals = np.array([0.01, -0.02, 0.03, 0.00, 0.02])
+        resid = pd.DataFrame({"AAA": vals}, index=idx)
+        feats = build_residual_momentum_features(resid, horizons=[3])
+        window = vals[2:5]
+        expected = window.sum() / window.std()  # numpy std is ddof=0
+        assert np.isclose(
+            feats[3]["residual_momentum_scaled"].iloc[4], expected, atol=1e-12
+        )
+
+    def test_skip_bars_excludes_most_recent_residual(self):
+        idx = pd.date_range("2023-01-01", periods=6, freq="1D", tz="UTC")
+        vals = np.array([0.01, 0.02, 0.03, 0.04, 0.05, 100.0])
+        resid = pd.DataFrame({"AAA": vals}, index=idx)
+        feats = build_residual_momentum_features(resid, horizons=[3], skip_bars=1)
+        # At the last bar, the skip excludes the huge 100.0 print.
+        assert np.isclose(
+            feats[3]["residual_momentum"].iloc[5], 0.03 + 0.04 + 0.05, atol=1e-12
+        )
+
+    def test_raises_on_bad_params(self):
+        idx = pd.date_range("2023-01-01", periods=4, freq="1D", tz="UTC")
+        resid = pd.DataFrame({"AAA": 0.01}, index=idx)
+        with pytest.raises(ValueError, match="horizons"):
+            build_residual_momentum_features(resid, horizons=[0])
+        with pytest.raises(ValueError, match="skip_bars"):
+            build_residual_momentum_features(resid, horizons=[2], skip_bars=-1)
+
+
+# ---------------------------------------------------------------------------
+# select_momentum_feature_panel — residual family
+# ---------------------------------------------------------------------------
+
+class TestSelectMomentumFeaturePanelResidual:
+    def _pack_with_residuals(self, close_wide):
+        ret_wide = compute_bar_returns(close_wide, log_returns=True)
+        market = build_market_index_returns(ret_wide)
+        betas = pd.DataFrame(1.0, index=ret_wide.index, columns=ret_wide.columns)
+        return build_feature_panels(
+            close_wide=close_wide,
+            horizons=[2],
+            benchmark_symbol="AAA",
+            beta_panel=betas,
+            market_returns=market,
+        )
+
+    def test_returns_residual_panel_and_label(self, multi_symbol_close_wide):
+        pack = self._pack_with_residuals(multi_symbol_close_wide)
+        panel, label = select_momentum_feature_panel(
+            feature_pack=pack,
+            baseline_signal=None,
+            available_horizons=[2],
+            feature_family="residual",
+            feature_horizon=2,
+        )
+        assert label == "residual_momentum_scaled_2bar"
+        pd.testing.assert_frame_equal(
+            panel, pack["residual_features"][2]["residual_momentum_scaled"]
+        )
+
+    def test_raises_when_pack_lacks_residuals(self, multi_symbol_close_wide):
+        pack = build_feature_panels(
+            close_wide=multi_symbol_close_wide, horizons=[2], benchmark_symbol="AAA"
+        )
+        with pytest.raises(ValueError, match="residual_features"):
+            select_momentum_feature_panel(
+                feature_pack=pack,
+                baseline_signal=None,
+                available_horizons=[2],
+                feature_family="residual",
+                feature_horizon=2,
+            )
+
+    def test_raises_on_unknown_residual_feature(self, multi_symbol_close_wide):
+        pack = self._pack_with_residuals(multi_symbol_close_wide)
+        with pytest.raises(ValueError, match="residual_feature must be"):
+            select_momentum_feature_panel(
+                feature_pack=pack,
+                baseline_signal=None,
+                available_horizons=[2],
+                feature_family="residual",
+                feature_horizon=2,
+                residual_feature="not_a_feature",
+            )

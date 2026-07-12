@@ -39,6 +39,17 @@ def load_research_settings(config_path, base_config_path=None):
             "execution_delay_minutes_grid": list(
                 cfg.get("execution_delay_minutes_grid", [0, 1, 5, 15, 30, 60])
             ),
+            # Market-beta neutrality: market-index construction, rolling beta
+            # estimation, and the ex-ante beta-hedge overlay.
+            "market_index_mode": str(
+                cfg.get("market_index_mode", "equal_weight")
+            ).lower(),
+            "beta_window_bars": int(cfg.get("beta_window_bars", 90)),
+            "beta_min_periods_bars": cfg.get("beta_min_periods_bars"),
+            "beta_shrinkage": float(cfg.get("beta_shrinkage", 0.2)),
+            "beta_shrink_target": float(cfg.get("beta_shrink_target", 1.0)),
+            "beta_hedge_enabled": bool(cfg.get("beta_hedge_enabled", False)),
+            "max_hedge_weight": cfg.get("max_hedge_weight"),
             "momentum_lookback_bars": int(cfg.get("momentum_lookback_bars", 6)),
             "momentum_skip_bars": int(cfg.get("momentum_skip_bars", 0)),
             "log_returns": bool(cfg.get("log_returns", True)),
@@ -101,6 +112,20 @@ def load_research_settings(config_path, base_config_path=None):
             "panel; execution_delay_bars must stay 0 to avoid a double delay "
             f"(got execution_delay_bars={settings['execution_delay_bars']})"
         )
+
+    if settings["market_index_mode"] not in ("equal_weight", "benchmark"):
+        raise ValueError(
+            "market_index_mode must be 'equal_weight' or 'benchmark', "
+            f"got {settings['market_index_mode']!r}"
+        )
+    if not 0.0 <= settings["beta_shrinkage"] <= 1.0:
+        raise ValueError(
+            f"beta_shrinkage must be in [0, 1], got {settings['beta_shrinkage']}"
+        )
+    if settings["beta_min_periods_bars"] is not None:
+        settings["beta_min_periods_bars"] = int(settings["beta_min_periods_bars"])
+    if settings["max_hedge_weight"] is not None:
+        settings["max_hedge_weight"] = float(settings["max_hedge_weight"])
 
     if settings["max_assets"] is not None:
         settings["max_assets"] = int(settings["max_assets"])

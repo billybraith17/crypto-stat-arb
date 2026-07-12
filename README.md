@@ -75,8 +75,10 @@ check tying the two tables together.
 ### Momentum sleeve (`src/signals/cs_momentum.py`)
 
 Whether relative strength across the universe predicts cross-sectional returns. Feature families:
-multiple lookback horizons, relative (residual) momentum, volatility-adjusted momentum, and
-cross-sectional ranking.
+multiple lookback horizons, peer-relative momentum, volatility-adjusted momentum, **residual
+momentum** (momentum on beta-residualized returns, Blitz–Huij–Martens style — market neutrality
+built into the alpha itself), and cross-sectional ranking. Per-asset rolling betas are estimated
+against an equal-weight universe index on traded-masked returns, with shrinkage toward 1.
 
 ### Mean-reversion sleeve (`src/signals/cs_mean_reversion.py`)
 
@@ -91,6 +93,13 @@ Spearman/rank IC, Newey-West adjusted t-statistics, IC-decay heatmaps, quantile 
 analysis, a cost-aware long/short backtest (flat or per-asset spread costs), execution-delay
 sensitivity, walk-forward IC evaluation with embargoed folds, and selection-bias corrections
 (max-over-trials p-values, deflated Sharpe). The same helpers are reused across both sleeves.
+
+Market neutrality is measured and enforced, not assumed: ex-ante portfolio beta (Σ wᵢβᵢ) and
+its coverage are tracked bar by bar, realized betas are split by up-/down-market regime (a
+dollar-neutral book can hide large offsetting regime betas behind a full-sample correlation of
+~0), and an optional **beta-hedge overlay** adds a benchmark position sized to cancel the
+ex-ante beta at each rebalance — netted against any existing benchmark position, with hedge
+turnover fully costed in the backtest.
 
 Backtests fill at **real 1-minute closes** a configurable number of minutes after the signal
 bar's close (`src/research/execution.py`), rather than assuming execution at the very close the
@@ -110,7 +119,7 @@ a short-horizon reversal edge is just bid-ask bounce a taker could never capture
 These are research directions under consideration, not yet built:
 
 - Refining the existing momentum and mean-reversion features (stronger construction, additional
-  hypotheses).
+  hypotheses — residual momentum is now built; composite/low-turnover variants remain).
 - Moving from spot to perpetual futures to exploit lower fees and tighter spreads — directly
   relevant to the mean-reversion result, whose edge is currently consumed by spot transaction
   costs — with funding rates as an additional signal and cost dimension.
