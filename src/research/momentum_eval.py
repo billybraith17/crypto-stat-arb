@@ -143,6 +143,37 @@ def ic_summary(ic_series, nw_lag=0):
     }
 
 
+def feature_ic_row(
+    feature_wide,
+    forward_return_wide,
+    nw_lag=0,
+    min_assets=6,
+    tradable_forward_return_wide=None,
+):
+    """IC summary of one feature panel, optionally against tradable returns.
+
+    Returns the ``ic_summary`` dict for ``forward_return_wide`` (the raw
+    predictive-power reference). When ``tradable_forward_return_wide`` is
+    given (e.g. execution-priced returns), adds ``mean_ic_trad``,
+    ``t_nw_trad`` and ``ic_haircut`` (reference minus tradable mean IC).
+    """
+    row = ic_summary(
+        compute_ic_series(feature_wide, forward_return_wide, min_assets=min_assets),
+        nw_lag=nw_lag,
+    )
+    if tradable_forward_return_wide is not None:
+        trad = ic_summary(
+            compute_ic_series(
+                feature_wide, tradable_forward_return_wide, min_assets=min_assets
+            ),
+            nw_lag=nw_lag,
+        )
+        row["mean_ic_trad"] = trad["mean_ic"]
+        row["t_nw_trad"] = trad["t_stat_ic_nw"]
+        row["ic_haircut"] = row["mean_ic"] - trad["mean_ic"]
+    return row
+
+
 def compute_ic_decay_heatmap(
     candidate_signals: dict,
     close_wide: pd.DataFrame,
@@ -311,6 +342,101 @@ def build_quantile_weights(signal_wide, top_quantile=0.2, bottom_quantile=0.2):
     return long_weights - short_weights
 
 
+def build_banded_quantile_weights(
+    signal_wide,
+    top_quantile=0.2,
+    bottom_quantile=0.2,
+    band=0.0,
+):
+    """Quantile long/short weights with hysteresis (no-trade) bands.
+
+    ``build_quantile_weights`` re-selects the book from scratch every row, so
+    a name oscillating around the quantile boundary is churned in and out at
+    full cost for no new information. Here membership is *stateful*: a name
+    ENTERS the long book when its cross-sectional percentile rank reaches
+    ``1 - top_quantile``, but EXITS only when it falls below
+    ``1 - top_quantile - band`` (symmetrically for shorts). With ``band=0``
+    the entry and exit thresholds coincide and the output reproduces
+    ``build_quantile_weights`` exactly (see NaN note below). Held names are
+    equal-weighted per side each row.
+
+    Cadence: rows are processed in the order given, at whatever frequency the
+    input has. Pass the signal at *decision frequency* (e.g. the H-stepped
+    rows the backtest will actually rebalance on), then reindex/ffill the
+    result to the full index for ``run_light_backtest(weights_wide=...)`` —
+    state evolving at a faster cadence than the rebalance would let names
+    exit and re-enter invisibly between rebalances.
+
+    NaN handling: a name whose signal is NaN on a row is forced out (no basis
+    to hold it — e.g. it left the tradable universe); a row where the entire
+    signal is NaN keeps the previous row's weights (no information is not a
+    liquidation event — this is the one divergence from
+    ``build_quantile_weights``, which returns a flat row there). A name whose
+    long-stay and short-entry conditions hold simultaneously (possible only
+    for extreme ``band``) is dropped from both sides that row.
+    """
+    top_q = float(top_quantile)
+    bottom_q = float(bottom_quantile)
+    band = float(band)
+    if not (0.0 < top_q < 1.0 and 0.0 < bottom_q < 1.0):
+        raise ValueError("top_quantile and bottom_quantile must be in (0, 1)")
+    if band < 0.0:
+        raise ValueError("band must be >= 0")
+
+    ranks = signal_wide.rank(axis=1, pct=True).to_numpy()
+    n_rows, n_cols = ranks.shape
+    long_enter, long_exit = 1.0 - top_q, 1.0 - top_q - band
+    short_enter, short_exit = bottom_q, bottom_q + band
+
+    weights = np.zeros((n_rows, n_cols))
+    long_state = np.zeros(n_cols, dtype=bool)
+    short_state = np.zeros(n_cols, dtype=bool)
+    for i in range(n_rows):
+        row = ranks[i]
+        valid = ~np.isnan(row)
+        if not valid.any():
+            if i > 0:
+                weights[i] = weights[i - 1]
+            continue
+        long_state = valid & ((row >= long_enter) | (long_state & (row >= long_exit)))
+        short_state = valid & ((row <= short_enter) | (short_state & (row <= short_exit)))
+        ambiguous = long_state & short_state
+        long_state &= ~ambiguous
+        short_state &= ~ambiguous
+        n_long = int(long_state.sum())
+        n_short = int(short_state.sum())
+        if n_long:
+            weights[i, long_state] = 1.0 / n_long
+        if n_short:
+            weights[i, short_state] -= 1.0 / n_short
+
+    return pd.DataFrame(weights, index=signal_wide.index, columns=signal_wide.columns)
+
+
+def build_banded_book(
+    signal_wide,
+    holding_period_bars,
+    band,
+    top_quantile=0.2,
+    bottom_quantile=0.2,
+):
+    """Banded quantile book evolved at decision frequency, on the full index.
+
+    Membership state updates only on every ``holding_period_bars``-th row (the
+    rows ``run_light_backtest`` rebalances on, both starting at row 0) and is
+    forward-filled in between, so names cannot exit and re-enter invisibly
+    between rebalances. Pass the result as ``weights_wide``.
+    """
+    H = max(int(holding_period_bars), 1)
+    decision = build_banded_quantile_weights(
+        signal_wide.iloc[::H],
+        top_quantile=top_quantile,
+        bottom_quantile=bottom_quantile,
+        band=band,
+    )
+    return decision.reindex(signal_wide.index, method="ffill").fillna(0.0)
+
+
 def run_light_backtest(
     signal_wide,
     forward_return_wide,
@@ -345,14 +471,16 @@ def run_light_backtest(
     (``src.research.execution``) and keep ``execution_delay_bars=0``.
 
     Rebalances are netted at a single print: the old book exits and the new
-    book enters at the same execution close, with costs charged on net
-    turnover ``0.5 * sum(|dw|)``. Weight drift within the holding period is
-    ignored (light backtest).
+    book enters at the same execution close. ``fee_bps`` and
+    ``half_spread_bps`` are one-way rates paid on every fill, so costs are
+    charged on the full traded notional ``sum(|dw|)``. Reported turnover is
+    one-sided, ``0.5 * sum(|dw|)`` (the buy or sell side of the rebalance).
+    Weight drift within the holding period is ignored (light backtest).
 
     ``half_spread_bps`` may be a scalar (flat spread for all assets) or a
     per-symbol ``pd.Series`` in bps (e.g. from
     ``src.research.spreads.estimate_half_spread_bps_from_long``), in which
-    case each asset's turnover is charged at its own rate — flat spreads
+    case each asset's traded notional is charged at its own rate — flat spreads
     understate costs on the illiquid tail of the universe. Symbols missing
     from the Series (or NaN) are filled with the cross-sectional median of
     the supplied values; pass explicit values to override.
@@ -400,16 +528,18 @@ def run_light_backtest(
     gross_ret = (weights_step * realized_step).sum(axis=1, min_count=1)
     gross_ret = gross_ret.where(~bar_unpriceable, np.nan)
 
-    turnover_by_asset = 0.5 * weights_step.fillna(0.0).diff().abs()
-    turnover = turnover_by_asset.sum(axis=1)
+    # Every unit of |dw| is one fill paying the one-way fee plus half-spread.
+    traded_by_asset = weights_step.fillna(0.0).diff().abs()
+    traded = traded_by_asset.sum(axis=1)
+    turnover = 0.5 * traded
     if isinstance(half_spread_bps, pd.Series):
         spread_by_symbol = half_spread_bps.reindex(weights_step.columns)
         spread_by_symbol = spread_by_symbol.fillna(half_spread_bps.median())
         rate_by_symbol = (float(fee_bps) + spread_by_symbol) * 1e-4
-        costs = turnover_by_asset.mul(rate_by_symbol, axis=1).sum(axis=1)
+        costs = traded_by_asset.mul(rate_by_symbol, axis=1).sum(axis=1)
     else:
         cost_rate = (float(fee_bps) + float(half_spread_bps)) * 1e-4
-        costs = turnover * cost_rate
+        costs = traded * cost_rate
     net_ret = gross_ret - costs
 
     # Trim to the priceable holding window: from the first bar where weights
@@ -461,6 +591,15 @@ def run_light_backtest(
             "n_periods": int(len(net_ret)),
         },
     }
+
+
+def gross_sharpe(backtest):
+    """Annualised Sharpe of a ``run_light_backtest`` result's gross returns."""
+    gross = backtest["gross_returns"].dropna()
+    sd = gross.std(ddof=1)
+    if not sd > 0:
+        return np.nan
+    return float(np.sqrt(backtest["metrics"]["periods_per_year"]) * gross.mean() / sd)
 
 
 def quantile_analysis(signal_wide, forward_return_wide, n_quantiles=5, returns_are_log=False):
@@ -637,6 +776,7 @@ def build_beta_hedged_weights(
     benchmark_symbol="XBT/USD",
     missing_beta_fill=1.0,
     max_hedge_weight=None,
+    normalize_gross=True,
 ):
     """Overlay a benchmark position that cancels the ex-ante portfolio beta.
 
@@ -644,9 +784,13 @@ def build_beta_hedged_weights(
     ``benchmark_symbol`` column (created if absent), so an existing benchmark
     quantile position and the hedge net into a single position — one turnover
     charge, which is the correct portfolio accounting. The result is
-    beta-neutral instead of dollar-neutral (row sums are no longer 0), and
-    gross exposure becomes ``2 + |hedge|``; ``run_light_backtest`` reports it
-    as ``mean_gross_exposure``.
+    beta-neutral instead of dollar-neutral (row sums are no longer 0).
+
+    With ``normalize_gross=True`` each hedged row is rescaled to its pre-hedge
+    gross exposure, so hedged and unhedged books deploy identical capital and
+    drawdowns/returns compare like-for-like; the per-row scalar preserves the
+    zero ex-ante beta. ``normalize_gross=False`` keeps the raw overlay, whose
+    gross is the pre-hedge gross plus ``|hedge|``.
 
     Held positions with a missing beta are filled with ``missing_beta_fill``
     (default 1.0 — the sane crypto prior). This fill is deliberate, not
@@ -655,9 +799,8 @@ def build_beta_hedged_weights(
     ``±max_hedge_weight`` (beta noise at short windows can size absurd
     hedges).
 
-    Betas here are estimated on log bar returns while backtest P&L compounds
-    simple returns; at daily bars the mismatch is second-order and accepted
-    as light-backtest scope.
+    Pass betas estimated on simple returns, matching the arithmetic P&L the
+    hedge offsets.
     """
     fill = float(missing_beta_fill)
     betas_aligned = betas.reindex(index=weights.index, columns=weights.columns)
@@ -682,6 +825,11 @@ def build_beta_hedged_weights(
     if benchmark_symbol not in hedged.columns:
         hedged[benchmark_symbol] = 0.0
     hedged[benchmark_symbol] = hedged[benchmark_symbol].fillna(0.0) + hedge.fillna(0.0)
+    if normalize_gross:
+        gross_before = weights.abs().sum(axis=1)
+        gross_after = hedged.abs().sum(axis=1)
+        scale = gross_before.div(gross_after.replace(0.0, np.nan)).fillna(1.0)
+        hedged = hedged.mul(scale, axis=0)
     return hedged
 
 
@@ -850,6 +998,31 @@ def walk_forward_ic_table(ic_series, n_folds=5, embargo_obs=0, nw_lag=0):
                 "n_obs": stats["n_obs"],
                 "mean_ic": stats["mean_ic"],
                 "t_stat_ic_nw": stats["t_stat_ic_nw"],
+            }
+        )
+    return pd.DataFrame(rows).set_index("fold")
+
+
+def walk_forward_sharpe_table(returns, periods_per_year, n_folds=5, embargo_obs=0):
+    """Per-fold annualised Sharpe of a fixed book's period returns.
+
+    Folds and embargo follow ``walk_forward_splits``; ``embargo_obs`` is in
+    units of the return series (e.g. rebalance periods).
+    """
+    ppy = float(periods_per_year)
+    rows = []
+    for split in walk_forward_splits(returns.index, n_folds=n_folds, embargo_obs=embargo_obs):
+        block = returns.loc[split["test_index"]].dropna()
+        sd = block.std(ddof=1)
+        rows.append(
+            {
+                "fold": split["fold"],
+                "start": block.index.min(),
+                "end": block.index.max(),
+                "n_obs": len(block),
+                "sharpe_net": (
+                    float(np.sqrt(ppy) * block.mean() / sd) if (sd and sd > 0) else np.nan
+                ),
             }
         )
     return pd.DataFrame(rows).set_index("fold")

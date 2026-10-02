@@ -148,3 +148,11 @@ class TestHourlyRefactorUnchanged:
         assert out["ts"].is_monotonic_increasing
         assert not out["ts"].duplicated().any()
         assert (out["ts"] > START).all() and (out["ts"] <= END).all()
+
+
+class TestCopyLoadSymbol:
+    def test_empty_frame_returns_zero_without_engine(self):
+        """The empty-df short-circuit fires before any DB access, so a dummy
+        engine is never touched — guards against a no-op reload crashing."""
+        from src.data.build_minute_database import copy_load_symbol
+        assert copy_load_symbol(pd.DataFrame(columns=OHLCV_COLUMNS), engine=None) == 0

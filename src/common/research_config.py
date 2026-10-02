@@ -76,7 +76,7 @@ def load_research_settings(config_path, base_config_path=None):
             "bottom_quantile": float(cfg.get("bottom_quantile", 0.2)),
             "fee_bps": float(cfg.get("fee_bps", 2.0)),
             "half_spread_bps": float(cfg.get("half_spread_bps", 1.0)),
-            "cost_stress_multipliers": list(cfg.get("cost_stress_multipliers", [0.0, 1.0, 1.5, 2.0])),
+            "fee_tier_grid_bps": list(cfg.get("fee_tier_grid_bps", [])),
             "rolling_window_bars": int(cfg.get("rolling_window_bars", 60)),
             "extreme_event_quantile": float(cfg.get("extreme_event_quantile", 0.99)),
             "data_start_date": pd.Timestamp(
@@ -136,7 +136,11 @@ def load_research_settings(config_path, base_config_path=None):
     settings["momentum_skip_grid_bars"] = [int(x) for x in settings["momentum_skip_grid_bars"]]
     settings["holding_period_grid_bars"] = [int(x) for x in settings["holding_period_grid_bars"]]
     settings["universe_top_n_grid"] = [int(x) for x in settings["universe_top_n_grid"]]
-    settings["cost_stress_multipliers"] = [float(x) for x in settings["cost_stress_multipliers"]]
+    # One-way taker fee levels for the cost sensitivity; always includes the
+    # headline fee_bps so the base case is one of the reported tiers.
+    settings["fee_tier_grid_bps"] = sorted(
+        {float(x) for x in settings["fee_tier_grid_bps"]} | {settings["fee_bps"]}
+    )
     settings["execution_delay_minutes_grid"] = [
         int(x) for x in settings["execution_delay_minutes_grid"]
     ]

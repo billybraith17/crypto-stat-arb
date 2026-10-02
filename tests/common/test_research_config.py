@@ -51,7 +51,7 @@ class TestLoadRealConfig:
             "feature_horizons_bars",
             "momentum_lookback_grid_bars",
             "holding_period_grid_bars",
-            "cost_stress_multipliers",
+            "fee_tier_grid_bps",
             "data_start_date",
             "data_end_date",
             "train_split_date",
@@ -69,8 +69,13 @@ class TestLoadRealConfig:
         assert isinstance(s["fee_bps"], float)
         assert isinstance(s["feature_horizons_bars"], list)
         assert all(isinstance(h, int) for h in s["feature_horizons_bars"])
-        assert isinstance(s["cost_stress_multipliers"], list)
-        assert all(isinstance(x, float) for x in s["cost_stress_multipliers"])
+        assert isinstance(s["fee_tier_grid_bps"], list)
+        assert all(isinstance(x, float) for x in s["fee_tier_grid_bps"])
+
+    def test_fee_tier_grid_contains_headline_fee(self):
+        s = load_research_settings(REAL_CONFIG)
+        assert s["fee_bps"] in s["fee_tier_grid_bps"]
+        assert s["fee_tier_grid_bps"] == sorted(s["fee_tier_grid_bps"])
 
     def test_residual_space_is_valid(self):
         s = load_research_settings(REAL_CONFIG)

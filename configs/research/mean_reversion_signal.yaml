@@ -16,8 +16,7 @@ use_minute_execution: true
 execution_delay_minutes: 1
 execution_delay_minutes_grid: [0, 1, 5, 15, 30, 60]
 
-# Core signal window.  Short horizons capture intra-day / overnight reversals.
-# At 4h bars: reversal_lookback_bars=2 → 8h lookback, feature_horizons_bars=[1,2,4,6] → [4h–24h].
+# Core signal window (1h bars): a 2-bar lookback targets intraday reversal.
 reversal_lookback_bars: 2
 log_returns: true
 
@@ -38,22 +37,20 @@ benchmark_symbol: XBT/USD
 # Relative residuals: "log" (same units as core returns) or "simple" (P&L-aligned).
 residual_space: log
 
-# Market-beta neutrality (diagnostics only for this sleeve). Betas are
-# trailing Cov/Var vs the equal-weight universe index, shrunk toward 1.
-# 720 bars at 1h = 30 days of history per estimate.
-market_index_mode: equal_weight
+# Market-beta neutrality (diagnostics only for this sleeve); 720 bars = 30 days.
+market_index_mode: benchmark
 beta_window_bars: 720
-beta_min_periods_bars: null
+beta_min_periods_bars: 540
 beta_shrinkage: 0.2
 beta_shrink_target: 1.0
 beta_hedge_enabled: false
 max_hedge_weight: null
 
-# Feature families to compare (in signal bars).
-# [1, 2, 4, 6] = [4h, 8h, 16h, 24h] at 4h cadence — short-term reversals.
+# Feature horizons in signal bars: 1h to 6h.
 feature_horizons_bars: [1, 2, 4, 6]
 
-# Robustness grid parameters.
+# Robustness grid parameters (momentum_lookback_grid_bars is the reversal
+# lookback axis here; the key is shared with the momentum config).
 momentum_lookback_grid_bars: [1, 2, 4, 6]
 holding_period_grid_bars: [1, 2, 3, 4]
 cross_sectional_transform_grid: [rank]
@@ -70,12 +67,15 @@ train_split_date: 2022-06-30 23:59:59+00:00
 cross_sectional_transform: rank
 min_assets_per_timestamp: 6
 
-# Portfolio and costs.
+# Portfolio and costs. fee_bps and half_spread_bps are one-way rates charged
+# on every fill.
 top_quantile: 0.2
 bottom_quantile: 0.2
-fee_bps: 40.0
+fee_bps: 10.0
 half_spread_bps: 1.0
-cost_stress_multipliers: [0.0, 1.0, 1.5, 2.0]
+# One-way taker fee tiers for the cost sensitivity (fee_bps is always included):
+# 5 bps is the top professional tier; 40 bps a retail entry-tier rate.
+fee_tier_grid_bps: [5.0, 10.0, 20.0, 40.0]
 
 # Robustness diagnostics.
 rolling_window_bars: 360

@@ -13,9 +13,12 @@ import pytest
 from src.research.momentum_eval import (
     _infer_periods_per_year,
     _newey_west_se,
+    build_banded_book,
     build_beta_hedged_weights,
     build_quantile_weights,
     compute_ic_series,
+    feature_ic_row,
+    gross_sharpe,
     ic_summary,
     long_short_leg_returns,
     market_correlation,
@@ -26,6 +29,7 @@ from src.research.momentum_eval import (
     rolling_mean,
     rolling_sharpe,
     run_light_backtest,
+    walk_forward_sharpe_table,
 )
 
 
@@ -613,6 +617,14 @@ class TestPortfolioBetaSeries:
         out = portfolio_beta_series(weights, betas)
         assert np.allclose(out["beta_coverage"].values, 1.0, atol=1e-12)
 
+    def test_empty_book_row_gives_nan_coverage_not_inf(self):
+        # A bar with no positions (gross 0) must not divide-by-zero to inf.
+        weights = _const_panel({"AAA": 0.0, "BBB": 0.0})
+        betas = _const_panel({"AAA": 1.0, "BBB": 2.0})
+        out = portfolio_beta_series(weights, betas)
+        assert out["beta_coverage"].isna().all()
+        assert np.isfinite(out["beta_coverage"].to_numpy()).sum() == 0
+
 
 # ---------------------------------------------------------------------------
 # realized_beta_diagnostics
@@ -648,6 +660,15 @@ class TestRealizedBetaDiagnostics:
         # ... while the full-sample beta blends the two regimes.
         assert 0.0 < out["beta_full"] < 1.0
 
+    def test_disjoint_indices_return_empty_without_crashing(self):
+        s = pd.Series([0.01, 0.02, 0.03], index=_utc_index(3, start="2023-01-01"))
+        m = pd.Series([0.01, 0.02, 0.03], index=_utc_index(3, start="2024-01-01"))
+        out = realized_beta_diagnostics(s, m)
+        assert out["n_obs"] == 0
+        assert np.isnan(out["beta_full"]) and np.isnan(out["corr_full"])
+        assert np.isnan(out["beta_up"]) and np.isnan(out["beta_down"])
+        assert out["rolling_beta"].isna().all()
+
     def test_small_regime_returns_nan_with_counts(self):
         idx = _utc_index(6)
         m = pd.Series([0.01, -0.01, 0.02, -0.02, 0.03, -0.03], index=idx)
@@ -678,12 +699,32 @@ class TestBuildBetaHedgedWeights:
 
     def test_hedge_added_in_new_benchmark_column(self):
         weights, betas = self._base()
-        hedged = build_beta_hedged_weights(weights, betas)
+        hedged = build_beta_hedged_weights(weights, betas, normalize_gross=False)
         assert "XBT/USD" in hedged.columns
         # beta_p = 0.5, benchmark beta 1 -> hedge -0.5
         assert np.allclose(hedged["XBT/USD"].values, -0.5, atol=1e-12)
-        # Original book untouched.
+        # Original book untouched without normalization.
         pd.testing.assert_frame_equal(hedged[weights.columns], weights)
+
+    def test_gross_normalized_to_pre_hedge_gross(self):
+        weights, betas = self._base()
+        hedged = build_beta_hedged_weights(weights, betas)
+        # Pre-hedge gross 2.0; raw hedged gross 2.5 -> every weight scaled 0.8.
+        assert np.allclose(hedged.abs().sum(axis=1).values, 2.0, atol=1e-12)
+        assert np.allclose(hedged["XBT/USD"].values, -0.4, atol=1e-12)
+        assert np.allclose(hedged["AAA"].values, 0.4, atol=1e-12)
+
+    def test_normalization_preserves_zero_beta(self):
+        weights, betas = self._base()
+        hedged = build_beta_hedged_weights(weights, betas)
+        out = portfolio_beta_series(hedged, betas)
+        assert np.allclose(out["portfolio_beta"].values, 0.0, atol=1e-12)
+
+    def test_normalize_gross_false_keeps_raw_overlay(self):
+        weights, betas = self._base()
+        hedged = build_beta_hedged_weights(weights, betas, normalize_gross=False)
+        # Raw overlay gross = pre-hedge gross + |hedge| = 2.0 + 0.5.
+        assert np.allclose(hedged.abs().sum(axis=1).values, 2.5, atol=1e-12)
 
     def test_hedged_book_has_zero_ex_ante_beta(self):
         weights, betas = self._base()
@@ -698,7 +739,7 @@ class TestBuildBetaHedgedWeights:
         betas = _const_panel(
             {"AAA": 1.0, "BBB": 2.0, "CCC": 1.0, "XBT/USD": 1.0}
         )
-        hedged = build_beta_hedged_weights(weights, betas)
+        hedged = build_beta_hedged_weights(weights, betas, normalize_gross=False)
         # beta_p = 0.5 - 0.2 = 0.3 -> hedge -0.3, netting to -0.5 total.
         assert np.allclose(hedged["XBT/USD"].values, -0.5, atol=1e-12)
         out = portfolio_beta_series(hedged, betas)
@@ -706,13 +747,17 @@ class TestBuildBetaHedgedWeights:
 
     def test_max_hedge_weight_clips(self):
         weights, betas = self._base()
-        hedged = build_beta_hedged_weights(weights, betas, max_hedge_weight=0.3)
+        hedged = build_beta_hedged_weights(
+            weights, betas, max_hedge_weight=0.3, normalize_gross=False
+        )
         assert np.allclose(hedged["XBT/USD"].values, -0.3, atol=1e-12)
 
     def test_missing_beta_fill_applied_to_held_positions(self):
         weights = _const_panel({"AAA": 1.0, "BBB": -1.0})
         betas = _const_panel({"AAA": 2.0, "BBB": np.nan, "XBT/USD": 1.0})
-        hedged = build_beta_hedged_weights(weights, betas, missing_beta_fill=1.0)
+        hedged = build_beta_hedged_weights(
+            weights, betas, missing_beta_fill=1.0, normalize_gross=False
+        )
         # BBB beta filled with 1.0 -> beta_p = 2 - 1 = 1 -> hedge -1.
         assert np.allclose(hedged["XBT/USD"].values, -1.0, atol=1e-12)
 
@@ -720,6 +765,33 @@ class TestBuildBetaHedgedWeights:
         weights, betas = self._base()
         with pytest.raises(ValueError, match="max_hedge_weight"):
             build_beta_hedged_weights(weights, betas, max_hedge_weight=0.0)
+
+    def test_time_varying_betas_hedged_per_bar(self):
+        # Betas change bar to bar; the hedge must neutralise each bar on its own.
+        idx = _utc_index(4)
+        weights = pd.DataFrame(
+            {"AAA": [1.0] * 4, "BBB": [-1.0] * 4}, index=idx
+        )
+        betas = pd.DataFrame(
+            {"AAA": [1.0, 1.5, 2.0, 0.5],
+             "BBB": [1.0, 1.0, 1.0, 1.0],
+             "XBT/USD": [1.0, 1.0, 1.0, 1.0]},
+            index=idx,
+        )
+        hedged = build_beta_hedged_weights(weights, betas)
+        out = portfolio_beta_series(hedged, betas)
+        assert np.allclose(out["portfolio_beta"].values, 0.0, atol=1e-12)
+        # Raw (un-normalised) hedge equals -(beta_p) each bar: -(1-1), -(1.5-1)...
+        raw = build_beta_hedged_weights(weights, betas, normalize_gross=False)
+        assert np.allclose(raw["XBT/USD"].values, [0.0, -0.5, -1.0, 0.5], atol=1e-12)
+
+    def test_normalize_gross_empty_book_row_is_safe(self):
+        # A flat bar (no positions, no hedge) must not divide-by-zero.
+        weights = _const_panel({"AAA": 0.0, "BBB": 0.0})
+        betas = _const_panel({"AAA": 1.0, "BBB": 2.0, "XBT/USD": 1.0})
+        hedged = build_beta_hedged_weights(weights, betas)
+        assert np.isfinite(hedged.to_numpy()).all()
+        assert np.allclose(hedged.to_numpy(), 0.0, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------
@@ -783,10 +855,10 @@ class TestRunLightBacktestWeightsWide:
     def test_hedge_turnover_charged_flat(self):
         w, fwd = self._hedged_setup()
         bt = run_light_backtest(None, fwd, weights_wide=w, fee_bps=10, half_spread_bps=0)
-        # Bar 3 rebalance: 0.5*(|1-0.5| + |0-0.5| + 0 + |0-(-0.5)|) = 0.75,
-        # of which 0.25 is the hedge unwind.
+        # Bar 3 rebalance: traded notional |1-0.5| + |0-0.5| + 0 + |0-(-0.5)|
+        # = 1.5 (0.5 of it the hedge unwind); one-sided turnover = 0.75.
         assert np.isclose(bt["turnover"].iloc[2], 0.75, atol=1e-12)
-        assert np.isclose(bt["costs"].iloc[2], 0.75 * 10e-4, atol=1e-15)
+        assert np.isclose(bt["costs"].iloc[2], 1.5 * 10e-4, atol=1e-15)
 
     def test_hedge_turnover_charged_at_benchmark_spread(self):
         w, fwd = self._hedged_setup()
@@ -796,6 +868,116 @@ class TestRunLightBacktestWeightsWide:
         bt = run_light_backtest(
             None, fwd, weights_wide=w, fee_bps=0, half_spread_bps=spreads
         )
-        # Bar 3: AAA 0.25 and BBB 0.25 at 10 bps; the 0.25 XBT hedge trade at
-        # its own 0 bps -> 0.5 * 10e-4, not 0.75 * 10e-4.
-        assert np.isclose(bt["costs"].iloc[2], 0.5 * 10e-4, atol=1e-15)
+        # Bar 3: AAA 0.5 and BBB 0.5 traded at 10 bps; the 0.5 XBT hedge trade
+        # at its own 0 bps -> 1.0 * 10e-4, not 1.5 * 10e-4.
+        assert np.isclose(bt["costs"].iloc[2], 1.0 * 10e-4, atol=1e-15)
+
+
+class TestOneWayCostConvention:
+    """Hand-priced rebalances: fee_bps and half_spread_bps are one-way rates
+    paid on every fill, so a full book rotation pays them on 4 units of
+    notional per unit of gross-2 capital."""
+
+    def _rotation(self):
+        idx = _utc_index(3, freq="1h")
+        cols = ["A", "B", "C", "D"]
+        w = pd.DataFrame(
+            [[0.0, 0.0, 0.0, 0.0],
+             [1.0, -1.0, 0.0, 0.0],   # enter: buy A, sell B
+             [0.0, 0.0, 1.0, -1.0]],  # rotate: sell A, buy C, buy B, sell D
+            index=idx, columns=cols,
+        )
+        fwd = pd.DataFrame(0.0, index=idx, columns=cols)
+        return w, fwd
+
+    def test_full_rotation_pays_one_way_rate_on_every_fill(self):
+        w, fwd = self._rotation()
+        bt = run_light_backtest(
+            None, fwd, weights_wide=w, fee_bps=40, half_spread_bps=10,
+            periods_per_year=8760,
+        )
+        # Entry: 2 fills x 50 bps; rotation: 4 fills x 50 bps.
+        assert np.allclose(bt["costs"].to_numpy(), [0.0100, 0.0200], atol=1e-15)
+        # Turnover is reported one-sided: 1 on entry, 2 on the rotation.
+        assert np.allclose(bt["turnover"].to_numpy(), [1.0, 2.0], atol=1e-15)
+        assert np.allclose(bt["net_returns"].to_numpy(), [-0.0100, -0.0200], atol=1e-15)
+
+    def test_per_asset_spreads_charged_per_fill(self):
+        w, fwd = self._rotation()
+        spreads = pd.Series({"A": 10.0, "B": 20.0, "C": 30.0, "D": 40.0})
+        bt = run_light_backtest(
+            None, fwd, weights_wide=w, fee_bps=0, half_spread_bps=spreads,
+            periods_per_year=8760,
+        )
+        # Entry: A 10 + B 20 = 30 bps; rotation: 10 + 20 + 30 + 40 = 100 bps.
+        assert np.allclose(bt["costs"].to_numpy(), [0.0030, 0.0100], atol=1e-15)
+
+
+class TestFeatureICRow:
+    def _data(self):
+        idx = _utc_index(30, freq="1h")
+        rng = np.random.default_rng(11)
+        cols = [f"S{i}" for i in range(8)]
+        feat = pd.DataFrame(rng.normal(size=(30, 8)), index=idx, columns=cols)
+        fwd = pd.DataFrame(rng.normal(size=(30, 8)), index=idx, columns=cols)
+        return feat, fwd
+
+    def test_reference_only_equals_ic_summary(self):
+        feat, fwd = self._data()
+        row = feature_ic_row(feat, fwd, nw_lag=2, min_assets=4)
+        assert row == ic_summary(compute_ic_series(feat, fwd, min_assets=4), nw_lag=2)
+        assert "mean_ic_trad" not in row
+
+    def test_identical_tradable_returns_zero_haircut(self):
+        feat, fwd = self._data()
+        row = feature_ic_row(feat, fwd, nw_lag=1, min_assets=4, tradable_forward_return_wide=fwd)
+        assert row["mean_ic_trad"] == row["mean_ic"]
+        assert row["t_nw_trad"] == row["t_stat_ic_nw"]
+        assert row["ic_haircut"] == 0.0
+
+
+class TestGrossSharpe:
+    def test_hand_computed(self):
+        idx = _utc_index(4, freq="1h")
+        bt = {
+            "gross_returns": pd.Series([0.01, 0.03, 0.01, 0.03], index=idx),
+            "metrics": {"periods_per_year": 100.0},
+        }
+        # mean 0.02, sample sd 0.011547 -> 10 * 0.02 / 0.011547
+        assert np.isclose(gross_sharpe(bt), 10 * 0.02 / np.std([0.01, 0.03, 0.01, 0.03], ddof=1))
+
+    def test_zero_variance_is_nan(self):
+        idx = _utc_index(3, freq="1h")
+        bt = {"gross_returns": pd.Series([0.01] * 3, index=idx), "metrics": {"periods_per_year": 1.0}}
+        assert np.isnan(gross_sharpe(bt))
+
+
+class TestBuildBandedBook:
+    def _signal(self, n=12, m=10, seed=5):
+        idx = _utc_index(n, freq="1h")
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame(rng.normal(size=(n, m)), index=idx, columns=[f"S{i}" for i in range(m)])
+
+    def test_weights_change_only_on_decision_rows(self):
+        sig = self._signal()
+        book = build_banded_book(sig, holding_period_bars=4, band=0.1)
+        assert book.index.equals(sig.index)
+        for start in range(0, 12, 4):
+            block = book.iloc[start:start + 4]
+            assert (block.eq(block.iloc[0], axis=1)).all().all()
+
+    def test_band_zero_matches_quantile_weights_on_decision_rows(self):
+        sig = self._signal()
+        book = build_banded_book(sig, holding_period_bars=3, band=0.0)
+        expected = build_quantile_weights(sig.iloc[::3]).fillna(0.0)
+        pd.testing.assert_frame_equal(book.iloc[::3], expected, check_freq=False)
+
+
+class TestWalkForwardSharpeTable:
+    def test_fold_sharpes_and_embargo(self):
+        idx = _utc_index(20, freq="1D")
+        returns = pd.Series(np.tile([0.01, 0.03], 10), index=idx)
+        table = walk_forward_sharpe_table(returns, periods_per_year=365, n_folds=2, embargo_obs=2)
+        assert table["n_obs"].tolist() == [10, 8]
+        expected = np.sqrt(365) * 0.02 / np.std([0.01, 0.03] * 5, ddof=1)
+        assert np.isclose(table.loc[1, "sharpe_net"], expected)

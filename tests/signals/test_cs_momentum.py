@@ -21,6 +21,7 @@ from src.signals.cs_momentum import (
     build_residual_return_panel,
     build_vol_adjusted_features,
     compute_bar_returns,
+    to_simple_returns,
     compute_forward_returns,
     compute_return_horizons,
     cross_sectional_rank_or_zscore,
@@ -104,6 +105,19 @@ class TestComputeBarReturns:
     def test_shape_preserved(self, simple_close_wide):
         result = compute_bar_returns(simple_close_wide)
         assert result.shape == simple_close_wide.shape
+
+
+class TestToSimpleReturns:
+    def test_log_input_converts_exactly(self, simple_close_wide):
+        log_ret = compute_bar_returns(simple_close_wide, log_returns=True)
+        simple_ret = compute_bar_returns(simple_close_wide, log_returns=False)
+        converted = to_simple_returns(log_ret, log_returns=True)
+        pd.testing.assert_frame_equal(converted, simple_ret)
+
+    def test_simple_input_is_noop(self, simple_close_wide):
+        simple_ret = compute_bar_returns(simple_close_wide, log_returns=False)
+        result = to_simple_returns(simple_ret, log_returns=False)
+        assert result is simple_ret
 
     def test_log_and_simple_consistent(self, multi_symbol_close_wide):
         """exp(log_return) - 1 should equal simple_return."""
@@ -631,6 +645,17 @@ class TestBuildMarketIndexReturns:
         with pytest.raises(KeyError, match="XBT/USD"):
             build_market_index_returns(ret_wide, mode="benchmark")
 
+    def test_raises_on_invalid_min_assets(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        with pytest.raises(ValueError, match="min_assets"):
+            build_market_index_returns(ret_wide, min_assets=0)
+
+    def test_all_nan_row_is_nan(self, multi_symbol_close_wide):
+        ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
+        ret_wide.iloc[4, :] = np.nan
+        market = build_market_index_returns(ret_wide, min_assets=1)
+        assert np.isnan(market.iloc[4])
+
     def test_raises_on_invalid_mode(self, multi_symbol_close_wide):
         ret_wide = compute_bar_returns(multi_symbol_close_wide, log_returns=True)
         with pytest.raises(ValueError, match="mode must be"):
@@ -705,6 +730,27 @@ class TestEstimateRollingBetas:
             estimate_rolling_betas(ret_wide, m, window_bars=4, shrinkage=1.5)
         with pytest.raises(ValueError, match="min_periods"):
             estimate_rolling_betas(ret_wide, m, window_bars=4, min_periods=1)
+
+    def test_min_periods_relaxation_estimates_earlier(self):
+        # Relaxing min_periods below the window yields betas before the window
+        # is full — the behaviour the research configs rely on (e.g. 540/720).
+        ret_wide, m = _beta_test_panel()
+        strict = estimate_rolling_betas(ret_wide, m, window_bars=4)
+        relaxed = estimate_rolling_betas(ret_wide, m, window_bars=4, min_periods=2)
+        # Strict: first valid at row 3 (0-indexed). Relaxed: first valid at row 1.
+        assert strict["AAA"].iloc[:3].isna().all()
+        assert relaxed["AAA"].iloc[0:1].isna().all()
+        assert not np.isnan(relaxed["AAA"].iloc[1])
+        # Where both are defined the estimates still recover the known betas.
+        assert np.allclose(relaxed["BBB"].iloc[3:].values, 2.0, atol=1e-12)
+
+    def test_full_shrinkage_collapses_to_target(self):
+        ret_wide, m = _beta_test_panel()
+        betas = estimate_rolling_betas(
+            ret_wide, m, window_bars=4, shrinkage=1.0, shrink_target=1.3
+        )
+        valid = betas.iloc[3:]
+        assert np.allclose(valid.values, 1.3, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------

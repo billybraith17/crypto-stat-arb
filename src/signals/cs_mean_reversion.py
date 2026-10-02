@@ -5,6 +5,8 @@ outperformance** (i.e. the reversal sign is already baked in where relevant).
 Functions imported from cs_momentum are used directly to avoid duplication.
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 
@@ -444,6 +446,179 @@ def build_xsec_rank_of_price_z(
     enough_assets = price_z.notna().sum(axis=1) >= min_assets
     xsec_rank = xsec_rank.where(enough_assets, np.nan)
     return {"xsec_rank_price_z": -xsec_rank}
+
+
+# ---------------------------------------------------------------------------
+# Composite signal (equal-weight across features)
+# ---------------------------------------------------------------------------
+
+
+def build_composite_signal(
+    feature_panels,
+    min_assets_per_timestamp=6,
+    min_features=2,
+):
+    """Equal-weight composite of cross-sectionally z-scored feature panels.
+
+    The honest alternative to quoting the best single feature: an argmax over
+    correlated features is a max-statistic, while a combination rule fixed
+    *a priori* (z-score each panel, average with equal weights) counts as ONE
+    trial in multiple-testing accounting. Averaging correlated same-sign
+    features also stabilises the signal — feature-level noise diversifies
+    away while the common reversal component adds up.
+
+    Parameters
+    ----------
+    feature_panels : dict[str, DataFrame] or list[DataFrame]
+        Sign-normalised feature panels (higher = buy), already restricted to
+        the tradable universe where applicable.
+    min_assets_per_timestamp : int
+        Passed to the per-panel cross-sectional z-score; rows with fewer
+        valid names are NaN.
+    min_features : int
+        Cells averaged over fewer than this many valid feature values are
+        NaN — a "composite" of one surviving feature is just that feature
+        wearing a composite's label.
+
+    Returns
+    -------
+    DataFrame — the composite raw panel. Not re-normalised: feed it through
+    ``cross_sectional_rank_or_zscore`` for the final signal, exactly as with
+    any single raw feature.
+    """
+    panels = (
+        list(feature_panels.values())
+        if isinstance(feature_panels, dict)
+        else list(feature_panels)
+    )
+    if len(panels) == 0:
+        raise ValueError("feature_panels is empty")
+    min_features = int(min_features)
+    if min_features < 1:
+        raise ValueError("min_features must be >= 1")
+
+    zscored = [
+        cross_sectional_rank_or_zscore(
+            panel,
+            method="zscore",
+            min_assets_per_timestamp=min_assets_per_timestamp,
+        )
+        for panel in panels
+    ]
+
+    index = zscored[0].index
+    columns = zscored[0].columns
+    for panel in zscored[1:]:
+        index = index.union(panel.index)
+        columns = columns.union(panel.columns)
+
+    total = pd.DataFrame(0.0, index=index, columns=columns)
+    count = pd.DataFrame(0, index=index, columns=columns)
+    for panel in zscored:
+        aligned = panel.reindex(index=index, columns=columns)
+        total += aligned.fillna(0.0)
+        count += aligned.notna().astype(int)
+
+    return total.div(count.where(count >= min_features))
+
+
+# ---------------------------------------------------------------------------
+# Feature lookup
+# ---------------------------------------------------------------------------
+
+# Fixed-window features: name fragment -> settings key holding the lookback.
+_FIXED_WINDOW_FEATURES = {
+    "price_zscore": "price_zscore_window_bars",
+    "bollinger": "bollinger_window_bars",
+    "rsi": "rsi_window_bars",
+    "range": "range_position_window_bars",
+    "xsec_rank_price_z": "price_zscore_window_bars",
+}
+
+
+def mean_reversion_feature_lookback(name, settings):
+    """Signal lookback in bars for a feature name, as used for NW lags.
+
+    Horizon features (``*_h{n}``) return ``n``; fixed-window features return
+    their window setting; anything else falls back to
+    ``settings["reversal_lookback_bars"]``.
+    """
+    match = re.search(r"_h(\d+)$", name)
+    if match:
+        return int(match.group(1))
+    for fragment, key in _FIXED_WINDOW_FEATURES.items():
+        if fragment in name:
+            return int(settings[key])
+    return int(settings["reversal_lookback_bars"])
+
+
+def get_mean_reversion_feature(name, feature_packs):
+    """Look up one feature panel by its IC-table name.
+
+    ``feature_packs`` maps family keys to builder outputs: ``reversal``,
+    ``price_z``, ``vol_adj``, ``extreme``, ``vol_exh``, ``vwap``, ``rsi``,
+    ``range``, ``xsec_z``.
+    """
+    match = re.search(r"_h(\d+)$", name)
+    h = int(match.group(1)) if match else None
+    horizon_features = [
+        ("reversal_h", "reversal", "reversal"),
+        ("xsec_reversal_h", "reversal", "xsec_reversal"),
+        ("vol_adj_xsec_reversal_h", "vol_adj", "vol_adj_xsec_reversal"),
+        ("vol_adj_reversal_h", "vol_adj", "vol_adj_reversal"),
+        ("vol_exhaustion_h", "vol_exh", "vol_exhaustion"),
+        ("vol_blowoff_h", "vol_exh", "vol_blowoff"),
+    ]
+    for prefix, pack, key in horizon_features:
+        if name.startswith(prefix):
+            return feature_packs[pack][h][key]
+    fixed_features = {
+        "price_zscore": ("price_z", "price_zscore"),
+        "bollinger_touch": ("price_z", "bollinger_touch"),
+        "extreme_signed_z": ("extreme", "signed_z"),
+        "extreme_flag": ("extreme", "extreme_flag"),
+        "distance_from_vwap": ("vwap", "distance_from_vwap"),
+        "distance_from_ma": ("vwap", "distance_from_ma"),
+        "rsi_proxy": ("rsi", "rsi_proxy"),
+        "range_position": ("range", "range_position"),
+        "xsec_rank_price_z": ("xsec_z", "xsec_rank_price_z"),
+    }
+    if name in fixed_features:
+        pack, key = fixed_features[name]
+        return feature_packs[pack][key]
+    raise ValueError(f"Unknown feature: {name!r}")
+
+
+def build_reversal_family_panel(
+    close_wide,
+    family,
+    lookback_bars,
+    vol_window_bars=14,
+    log_returns=True,
+    universe_mask=None,
+):
+    """One reversal-family feature at an arbitrary lookback (grid building).
+
+    ``family`` is the feature name without its horizon suffix: ``reversal``,
+    ``xsec_reversal``, ``vol_adj_reversal`` or ``vol_adj_xsec_reversal``.
+    Cells outside ``universe_mask`` are set to NaN.
+    """
+    lookback = int(lookback_bars)
+    if "vol_adj" in family:
+        panels = build_vol_adjusted_move(
+            close_wide, [lookback], vol_window_bars=vol_window_bars, log_returns=log_returns
+        )
+        key = "vol_adj_xsec_reversal" if "xsec" in family else "vol_adj_reversal"
+    else:
+        panels = build_return_reversal_features(
+            close_wide, [lookback], log_returns=log_returns
+        )
+        key = "xsec_reversal" if family == "xsec_reversal" else "reversal"
+    raw = panels[lookback][key]
+    if universe_mask is not None:
+        aligned = universe_mask.reindex(index=raw.index, columns=raw.columns).fillna(False)
+        raw = raw.where(aligned)
+    return raw
 
 
 # ---------------------------------------------------------------------------

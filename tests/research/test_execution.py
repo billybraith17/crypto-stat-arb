@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 
 from src.research.execution import (
+    _zero_delay_mismatch,
     build_execution_close_panel,
     compute_execution_forward_returns,
 )
@@ -163,3 +164,136 @@ class TestComputeExecutionForwardReturns:
         pd.testing.assert_frame_equal(
             fwd_exec, fwd_close, check_freq=False, check_names=False
         )
+
+
+class TestZeroDelayMismatch:
+    def _frames(self):
+        idx = _hourly_index(3)
+        cols = ["AAA", "BBB"]
+        close = pd.DataFrame(
+            {"AAA": [100.0, 101.0, 102.0], "BBB": [50.0, 50.5, 51.0]}, index=idx
+        )
+        volume = pd.DataFrame(
+            {"AAA": [1.0, 1.0, 1.0], "BBB": [1.0, 1.0, 1.0]}, index=idx, columns=cols
+        )
+        return idx, cols, close, volume
+
+    def test_clean_match(self):
+        idx, cols, close, volume = self._frames()
+        direct0 = close.copy()  # δ=0 exec close == hourly close everywhere
+        s = _zero_delay_mismatch(direct0, close, volume)
+        assert s["n_cells"] == 6
+        assert s["n_synth_with_1m"] == 0
+        assert s["max_rel_diff"] == 0.0
+
+    def test_synthetic_bar_excluded_not_flagged(self):
+        idx, cols, close, volume = self._frames()
+        # BBB bar 1 is a forward-filled hourly bar (volume 0) but 1m has a
+        # (different) real print — must be counted as synthetic, not drift.
+        volume.loc[idx[1], "BBB"] = 0.0
+        direct0 = close.copy()
+        direct0.loc[idx[1], "BBB"] = 999.0
+        s = _zero_delay_mismatch(direct0, close, volume)
+        assert s["n_synth_with_1m"] == 1
+        assert s["n_cells"] == 5
+        assert s["max_rel_diff"] == 0.0  # the 999 bar is excluded from comparison
+
+    def test_real_drift_is_caught(self):
+        idx, cols, close, volume = self._frames()
+        direct0 = close.copy()
+        direct0.loc[idx[0], "AAA"] = 110.0  # 10% drift on a real-trade bar
+        s = _zero_delay_mismatch(direct0, close, volume)
+        assert abs(s["max_rel_diff"] - 0.1) < 1e-12
+
+    def test_missing_1m_cell_ignored(self):
+        idx, cols, close, volume = self._frames()
+        direct0 = close.copy()
+        direct0.loc[idx[2], "AAA"] = np.nan  # no 1m print this bar
+        s = _zero_delay_mismatch(direct0, close, volume)
+        assert s["n_cells"] == 5
+        assert s["max_rel_diff"] == 0.0
+
+
+class TestZeroDelayMismatchEdge:
+    def test_no_comparable_cells_is_not_drift(self):
+        """When no real-trade cell has a 1m print, n_cells=0 and max_rel_diff
+        must be 0.0 (not NaN), so the downstream assert does not spuriously
+        fire on an empty comparison."""
+        idx = _hourly_index(2)
+        close = pd.DataFrame({"AAA": [100.0, 101.0]}, index=idx)
+        volume = pd.DataFrame({"AAA": [0.0, 0.0]}, index=idx)  # all synthetic bars
+        direct0 = pd.DataFrame({"AAA": [100.0, 101.0]}, index=idx)
+        s = _zero_delay_mismatch(direct0, close, volume)
+        assert s["n_cells"] == 0
+        assert s["max_rel_diff"] == 0.0
+        assert s["n_synth_with_1m"] == 2
+
+
+class TestExecutionPriceCache:
+    def _cache(self, monkeypatch, minute_exec_closes_long, calls):
+        import src.research.execution as execution
+
+        def fake_fetch(engine, start_ts, end_ts, delay_minutes, symbols):
+            calls.append(delay_minutes)
+            return minute_exec_closes_long
+
+        monkeypatch.setattr(execution, "fetch_minute_exec_closes", fake_fetch)
+        idx = _hourly_index(6)
+        close_wide = pd.DataFrame(
+            {"AAA": np.arange(100.0, 106.0), "BBB": np.arange(50.0, 56.0)}, index=idx
+        )
+        return execution.ExecutionPriceCache(engine=None, close_wide=close_wide)
+
+    def test_fetches_once_per_delay(self, monkeypatch, minute_exec_closes_long):
+        calls = []
+        cache = self._cache(monkeypatch, minute_exec_closes_long, calls)
+        cache.close_panel(1)
+        cache.diagnostics(1)
+        cache.forward_returns(1, holding_period_bars=2)
+        cache.close_panel(5)
+        assert calls == [1, 5]
+
+    def test_forward_returns_match_direct_computation(
+        self, monkeypatch, minute_exec_closes_long
+    ):
+        cache = self._cache(monkeypatch, minute_exec_closes_long, [])
+        expected = compute_execution_forward_returns(
+            cache.close_panel(1),
+            holding_period_bars=2,
+            log_returns=True,
+            direct_fill_mask=cache.diagnostics(1)["direct_fill_mask"],
+        )
+        pd.testing.assert_frame_equal(
+            cache.forward_returns(1, holding_period_bars=2, log_returns=True), expected
+        )
+
+
+class TestRunDelaySweep:
+    def test_each_delay_backtests_its_own_prices(self):
+        from src.research.execution import run_delay_sweep
+        from src.research.momentum_eval import run_light_backtest
+
+        idx = _hourly_index(8)
+        cols = [f"S{i}" for i in range(6)]
+        rng = np.random.default_rng(3)
+        signal = pd.DataFrame(rng.normal(size=(8, 6)), index=idx, columns=cols)
+        fwd_by_delay = {
+            d: pd.DataFrame(rng.normal(0, 0.01, size=(8, 6)), index=idx, columns=cols)
+            for d in (0, 5)
+        }
+
+        class _Prices:
+            def forward_returns(self, delay, holding_period_bars, log_returns=True):
+                return fwd_by_delay[delay]
+
+        out = run_delay_sweep(
+            signal, _Prices(), [0, 5], holding_period_bars=2, log_returns=False,
+            fee_bps=10.0, half_spread_bps=1.0,
+        )
+        assert list(out) == [0, 5]
+        for d in (0, 5):
+            direct = run_light_backtest(
+                signal, fwd_by_delay[d], fee_bps=10.0, half_spread_bps=1.0,
+                returns_are_log=False, holding_period_bars=2,
+            )
+            pd.testing.assert_series_equal(out[d]["net_returns"], direct["net_returns"])

@@ -44,6 +44,13 @@ def compute_bar_returns(close_wide, log_returns=True):
     return close_wide.pct_change()
 
 
+def to_simple_returns(return_wide, log_returns=True):
+    """Convert a return panel to simple-return space; no-op if already simple."""
+    if log_returns:
+        return np.exp(return_wide) - 1.0
+    return return_wide
+
+
 def build_traded_mask(df_long, signal_timeframe):
     """Boolean ts × symbol panel: True where the bar contains >= 1 real trade.
 
@@ -604,6 +611,39 @@ def build_selected_momentum_signal(
     if apply_rebalance_decimation_flag:
         signal = apply_rebalance_decimation(signal, ic_rebalance_bars)
     return signal
+
+
+def build_residual_momentum_signal(
+    return_wide,
+    betas,
+    market_returns,
+    horizon,
+    skip_bars=0,
+    feature="residual_momentum_scaled",
+    universe_mask=None,
+    cross_sectional_transform="zscore",
+    min_assets_per_timestamp=6,
+    apply_xsec_transform=True,
+):
+    """Residual-momentum signal (pre-decimation) from a given beta panel.
+
+    Residualises ``return_wide`` against ``market_returns`` with ``betas``,
+    builds the ``feature`` variant at ``horizon`` and applies the universe
+    mask and cross-sectional transform — isolating the beta-estimation inputs
+    so their effect on the signal can be swept.
+    """
+    residuals = build_residual_return_panel(return_wide, betas, market_returns)
+    features = build_residual_momentum_features(
+        residuals, horizons=[int(horizon)], skip_bars=skip_bars
+    )
+    return build_selected_momentum_signal(
+        raw_panel=features[int(horizon)][feature],
+        universe_mask=universe_mask,
+        cross_sectional_transform=cross_sectional_transform,
+        min_assets_per_timestamp=min_assets_per_timestamp,
+        apply_xsec_transform=apply_xsec_transform,
+        apply_rebalance_decimation_flag=False,
+    )
 
 
 def build_momentum_signal(
