@@ -1,5 +1,7 @@
 # Cross-Sectional Statistical Arbitrage — Crypto
 
+[![CI](https://github.com/billybraith17/crypto-stat-arb/actions/workflows/ci.yml/badge.svg)](https://github.com/billybraith17/crypto-stat-arb/actions/workflows/ci.yml)
+
 A research codebase for developing and validating **cross-sectional alpha signals** in
 cryptocurrency markets, using hourly and 1-minute OHLCV data for liquid Kraken USD pairs.
 
@@ -191,13 +193,14 @@ These are research directions under consideration, not yet built:
 ## Running it yourself
 
 ```bash
-pip install -r requirements.txt      # uses .venv
+uv sync              # create .venv from uv.lock (requires uv)
 
 # PostgreSQL credentials are read from .env (see "Configuration" below)
 make build-db        # build the DB from raw CSVs
 make pipeline        # full pipeline: build → quality checks → warnings → run logging
 make quality         # quality checks against an existing DB
-pytest               # run the test suite
+uv run pytest        # run the test suite
+uv run ruff check .  # lint
 ```
 
 A database is only needed to *re-run* the notebooks; the committed outputs can be read as-is.
@@ -230,7 +233,7 @@ run_pipeline.py # pipeline entry point
 
 ## Technologies
 
-Python · pandas · NumPy · SciPy · PostgreSQL (SQLAlchemy / psycopg2) · Matplotlib · Jupyter · pytest
+Python · pandas · NumPy · SciPy · PostgreSQL (SQLAlchemy / psycopg2) · Matplotlib · Jupyter · pytest · uv · ruff · GitHub Actions
 
 ---
 

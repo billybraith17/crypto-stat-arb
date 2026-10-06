@@ -8,7 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 from src.data.build_database_from_csv import _clean_raw_frame, prepare_dataframe
 from src.data.build_minute_database import (
@@ -17,7 +16,6 @@ from src.data.build_minute_database import (
     minute_csv_path,
     prepare_minute_dataframe,
 )
-
 
 START = pd.Timestamp("2022-12-31 23:59:59", tz="UTC")
 END = pd.Timestamp("2023-01-02 23:59:59", tz="UTC")

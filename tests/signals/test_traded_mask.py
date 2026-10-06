@@ -22,7 +22,7 @@ def _long_with_trades(trades_by_symbol, freq="1h"):
     idx = _utc_index(n, freq=freq)
     rows = []
     for sym, trades in trades_by_symbol.items():
-        for ts, tr in zip(idx, trades):
+        for ts, tr in zip(idx, trades, strict=True):
             rows.append({"ts": ts, "symbol": sym, "close": 100.0, "trades": tr})
     return pd.DataFrame(rows)
 

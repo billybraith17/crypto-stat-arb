@@ -1,6 +1,6 @@
-.PHONY: help build-db build-db-1m pipeline quality-checks quality-warnings quality-all
+.PHONY: help build-db build-db-1m pipeline quality
 
-PYTHON ?= python3
+PYTHON ?= uv run python
 
 help:
 	@echo "Available targets:"

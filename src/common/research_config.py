@@ -17,7 +17,7 @@ def load_research_settings(config_path, base_config_path=None):
     keys are present in the config file.  To add a new knob, add it to that
     block and to the relevant YAML.
     """
-    with open(Path(config_path), "r") as f:
+    with open(Path(config_path)) as f:
         cfg = yaml.safe_load(f) or {}
 
     base_path = base_config_path or cfg.get("reference_base_config")

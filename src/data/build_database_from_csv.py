@@ -8,7 +8,6 @@ Steps:
 5. Build monthly top-n liquidity universe
 """
 
-import os
 import re
 
 import pandas as pd
@@ -17,6 +16,7 @@ from sqlalchemy import text
 
 from src.common.config import load_settings
 from src.common.db import make_engine
+
 
 # =====================================================
 # TABLES
@@ -65,7 +65,7 @@ def parse_filename(filename, excluded_bases):
     quote = m.group(2)
     freq = int(m.group(3))
     symbol = f"{base}/{quote}"
-    
+
     if base in excluded_bases:
         return None
 

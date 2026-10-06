@@ -208,7 +208,7 @@ def _get_universe_turnover_details(engine, threshold):
 
     turnover_rows = []
     dates = sorted(universe_df["rebalance_date"].unique())
-    for d_prev, d_cur in zip(dates[:-1], dates[1:]):
+    for d_prev, d_cur in zip(dates[:-1], dates[1:], strict=True):
         prev_symbols = set(universe_df[universe_df["rebalance_date"] == d_prev]["symbol"])
         cur_symbols = set(universe_df[universe_df["rebalance_date"] == d_cur]["symbol"])
         if prev_symbols:

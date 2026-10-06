@@ -14,12 +14,10 @@ from src.signals.cs_momentum import (
     apply_rebalance_decimation,
     build_monthly_universe_mask,
     compute_bar_returns,
-    compute_forward_returns,
     compute_return_horizons,
     cross_sectional_rank_or_zscore,
     resample_to_signal_timeframe,
 )
-
 
 # ---------------------------------------------------------------------------
 # Internal helpers

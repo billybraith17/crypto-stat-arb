@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 def load_settings(config_path="configs/base.yaml"):
     load_dotenv()
 
-    with open(Path(config_path), "r") as f:
+    with open(Path(config_path)) as f:
         cfg = yaml.safe_load(f)
 
     settings = {

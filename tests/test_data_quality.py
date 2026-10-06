@@ -8,7 +8,6 @@ from src.common.db import make_engine
 from src.data.checks import run_checks, run_minute_checks
 from src.data.warnings import run_warnings
 
-
 if __name__ == "__main__":
     _settings = load_settings()
     _engine = make_engine(_settings)

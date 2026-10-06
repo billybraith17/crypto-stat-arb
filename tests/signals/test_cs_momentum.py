@@ -21,7 +21,6 @@ from src.signals.cs_momentum import (
     build_residual_return_panel,
     build_vol_adjusted_features,
     compute_bar_returns,
-    to_simple_returns,
     compute_forward_returns,
     compute_return_horizons,
     cross_sectional_rank_or_zscore,
@@ -29,8 +28,8 @@ from src.signals.cs_momentum import (
     resample_to_signal_timeframe,
     rolling_momentum_score,
     select_momentum_feature_panel,
+    to_simple_returns,
 )
-
 
 # ---------------------------------------------------------------------------
 # _validate_long_panel
@@ -350,7 +349,7 @@ class TestBuildMonthlyUniverseMask:
     def test_output_is_bool_dtype(self, universe_df):
         idx = pd.date_range("2023-01-02", periods=4, freq="D", tz="UTC")
         mask = build_monthly_universe_mask(idx, ["AAA", "BBB", "CCC"], universe_df)
-        assert mask.dtypes.apply(lambda dt: dt == bool).all()
+        assert mask.dtypes.apply(pd.api.types.is_bool_dtype).all()
 
     def test_raises_on_missing_required_columns(self):
         bad_df = pd.DataFrame({"symbol": ["AAA"]})

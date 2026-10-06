@@ -5,14 +5,12 @@ the real momentum_signal.yaml so they also serve as a smoke test that the
 checked-in config is internally consistent.
 """
 
-import tempfile
 from pathlib import Path
 
 import pytest
 import yaml
 
 from src.common.research_config import load_research_settings
-
 
 REAL_CONFIG = "configs/research/momentum_signal.yaml"
 
