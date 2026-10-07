@@ -173,6 +173,41 @@ class TestComputeICSeries:
         with pytest.raises(ValueError, match="min_assets must be >= 2"):
             compute_ic_series(sig, sig, min_assets=1)
 
+    @pytest.mark.parametrize("method", ["spearman", "pearson"])
+    def test_matches_per_timestamp_pandas_correlation(self, method):
+        """Row-wise result equals Series.corr on each timestamp's valid pairs."""
+        rng = np.random.default_rng(3)
+        idx = _utc_index(200)
+        cols = [f"S{i}" for i in range(12)]
+        sig = pd.DataFrame(rng.normal(size=(200, 12)), index=idx, columns=cols).round(1)
+        fwd = pd.DataFrame(rng.normal(size=(200, 12)), index=idx, columns=cols)
+        sig = sig.where(rng.random((200, 12)) < 0.7)
+        fwd = fwd.where(rng.random((200, 12)) < 0.9)
+        sig.iloc[5:8] = np.nan
+        sig.iloc[10] = 1.0
+
+        ic = compute_ic_series(sig, fwd, method=method, min_assets=6)
+
+        expected = {}
+        for ts in idx:
+            pair = pd.concat([sig.loc[ts], fwd.loc[ts]], axis=1, keys=["s", "f"]).dropna()
+            if pair.empty:
+                continue
+            if len(pair) < 6 or pair["s"].nunique() < 2 or pair["f"].nunique() < 2:
+                expected[ts] = np.nan
+            else:
+                expected[ts] = pair["s"].corr(pair["f"], method=method)
+        expected = pd.Series(expected)
+
+        assert ic.index.equals(expected.index)
+        assert ic.isna().sum() == expected.isna().sum() > 0
+        np.testing.assert_allclose(ic.to_numpy(), expected.to_numpy(), rtol=0, atol=1e-12)
+
+    def test_raises_on_unknown_method(self):
+        sig = pd.DataFrame({"A": [1.0], "B": [2.0]}, index=_utc_index(1))
+        with pytest.raises(ValueError, match="method must be"):
+            compute_ic_series(sig, sig, method="kendall")
+
 
 # ---------------------------------------------------------------------------
 # ic_summary

@@ -17,6 +17,7 @@ from src.signals.cs_momentum import (
     compute_return_horizons,
     cross_sectional_rank_or_zscore,
     resample_to_signal_timeframe,
+    rolling_mean_std,
 )
 
 # ---------------------------------------------------------------------------
@@ -125,13 +126,11 @@ def build_price_zscore_features(
     window_b = int(bollinger_window_bars)
     n_std = float(n_std)
 
-    rolling_mean_z = close_wide.rolling(window_z, min_periods=window_z).mean()
-    rolling_std_z = close_wide.rolling(window_z, min_periods=window_z).std(ddof=0)
+    rolling_mean_z, rolling_std_z = rolling_mean_std(close_wide, window_z)
 
     price_zscore = close_wide.sub(rolling_mean_z).div(rolling_std_z.replace(0.0, np.nan))
 
-    rolling_mean_b = close_wide.rolling(window_b, min_periods=window_b).mean()
-    rolling_std_b = close_wide.rolling(window_b, min_periods=window_b).std(ddof=0)
+    rolling_mean_b, rolling_std_b = rolling_mean_std(close_wide, window_b)
     upper_band = rolling_mean_b.add(n_std * rolling_std_b)
     lower_band = rolling_mean_b.sub(n_std * rolling_std_b)
 
@@ -171,7 +170,7 @@ def build_vol_adjusted_move(
     """
     vol_window = int(vol_window_bars)
     bar_returns = compute_bar_returns(close_wide, log_returns=log_returns)
-    rolling_vol = bar_returns.rolling(vol_window, min_periods=vol_window).std(ddof=0)
+    _, rolling_vol = rolling_mean_std(bar_returns, vol_window)
 
     horizon_returns = compute_return_horizons(close_wide, horizons=horizons, log_returns=log_returns)
     out = {}
@@ -212,8 +211,7 @@ def build_extreme_move_indicator(
     """
     vol_window = int(vol_window_bars)
     bar_ret = compute_bar_returns(close_wide, log_returns=log_returns)
-    rolling_mean = bar_ret.rolling(vol_window, min_periods=vol_window).mean()
-    rolling_std = bar_ret.rolling(vol_window, min_periods=vol_window).std(ddof=0)
+    rolling_mean, rolling_std = rolling_mean_std(bar_ret, vol_window)
 
     z = bar_ret.sub(rolling_mean).div(rolling_std.replace(0.0, np.nan))
     signed_z_negated = -z
@@ -435,8 +433,7 @@ def build_xsec_rank_of_price_z(
                                  price z-score
     """
     window = int(price_zscore_window_bars)
-    rolling_mean = close_wide.rolling(window, min_periods=window).mean()
-    rolling_std = close_wide.rolling(window, min_periods=window).std(ddof=0)
+    rolling_mean, rolling_std = rolling_mean_std(close_wide, window)
     price_z = close_wide.sub(rolling_mean).div(rolling_std.replace(0.0, np.nan))
 
     min_assets = int(min_assets_per_timestamp)

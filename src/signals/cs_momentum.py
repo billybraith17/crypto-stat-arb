@@ -212,14 +212,47 @@ def build_relative_momentum_features(
     }
 
 
+def rolling_mean_std(panel, window, ddof=0):
+    """Trailing-window mean and standard deviation, computed window by window.
+
+    Each window's moments come from its own observations, so the result does
+    not carry the cancellation error of an online add/remove variance update,
+    which is material after a price changes level by orders of magnitude.
+    A window of identical values has a standard deviation of exactly zero.
+    Full windows only: any NaN in the window yields NaN (``min_periods=window``).
+    """
+    window = int(window)
+    if window < 1:
+        raise ValueError("window must be >= 1")
+    values = panel.to_numpy(dtype=float)
+    mean = np.full(values.shape, np.nan)
+    std = np.full(values.shape, np.nan)
+    if len(values) >= window:
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for j in range(values.shape[1]):
+                windows = np.lib.stride_tricks.sliding_window_view(values[:, j], window)
+                col_mean = windows.mean(axis=1)
+                col_std = windows.std(axis=1, ddof=ddof)
+                flat = windows.max(axis=1) == windows.min(axis=1)
+                col_mean[flat] = windows[flat, 0]
+                col_std[flat & np.isfinite(col_std)] = 0.0
+                col_mean[~np.isfinite(col_mean)] = np.nan
+                col_std[~np.isfinite(col_std)] = np.nan
+                mean[window - 1 :, j] = col_mean
+                std[window - 1 :, j] = col_std
+    return (
+        pd.DataFrame(mean, index=panel.index, columns=panel.columns),
+        pd.DataFrame(std, index=panel.index, columns=panel.columns),
+    )
+
+
 def build_vol_adjusted_features(return_wide, vol_window_bars=24):
     """Build volatility-adjusted and time-series z-scored returns."""
     window = int(vol_window_bars)
     if window <= 1:
         raise ValueError("vol_window_bars must be > 1")
 
-    rolling_vol = return_wide.rolling(window, min_periods=window).std(ddof=0)
-    rolling_mean = return_wide.rolling(window, min_periods=window).mean()
+    rolling_mean, rolling_vol = rolling_mean_std(return_wide, window)
 
     # Return-over-vol (no demean) vs textbook z-score (demean then scale): distinct.
     vol_adjusted = return_wide.div(rolling_vol.replace(0.0, np.nan))
@@ -364,7 +397,7 @@ def build_residual_momentum_features(residual_return_wide, horizons, skip_bars=0
             raise ValueError("All horizons must be > 0")
         working = residual_return_wide.shift(skip)
         resid_sum = working.rolling(h, min_periods=h).sum()
-        resid_std = working.rolling(h, min_periods=h).std(ddof=0)
+        _, resid_std = rolling_mean_std(working, h)
         features[h] = {
             "residual_momentum": resid_sum,
             "residual_momentum_scaled": resid_sum.div(resid_std.replace(0.0, np.nan)),

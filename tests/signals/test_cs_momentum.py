@@ -26,6 +26,7 @@ from src.signals.cs_momentum import (
     cross_sectional_rank_or_zscore,
     estimate_rolling_betas,
     resample_to_signal_timeframe,
+    rolling_mean_std,
     rolling_momentum_score,
     select_momentum_feature_panel,
     to_simple_returns,
@@ -879,3 +880,56 @@ class TestSelectMomentumFeaturePanelResidual:
                 feature_horizon=2,
                 residual_feature="not_a_feature",
             )
+
+
+# ---------------------------------------------------------------------------
+# rolling_mean_std
+# ---------------------------------------------------------------------------
+
+class TestRollingMeanStd:
+    def _panel(self, values):
+        idx = pd.date_range("2022-05-01", periods=len(values), freq="h", tz="UTC")
+        return pd.DataFrame({"A": values}, index=idx)
+
+    def test_matches_pandas_on_well_conditioned_data(self):
+        rng = np.random.default_rng(0)
+        panel = self._panel(100.0 + rng.normal(size=300).cumsum())
+        mean, std = rolling_mean_std(panel, 24)
+        rolling = panel.rolling(24, min_periods=24)
+        pd.testing.assert_frame_equal(mean, rolling.mean(), rtol=1e-10)
+        pd.testing.assert_frame_equal(std, rolling.std(ddof=0), rtol=1e-8)
+
+    def test_exact_after_price_level_collapse(self):
+        """Moments stay accurate when the level falls by six orders of magnitude."""
+        rng = np.random.default_rng(1)
+        high = 80.0 * np.exp(rng.normal(0, 0.01, 200).cumsum())
+        low = 1e-4 * np.exp(rng.normal(0, 0.01, 200).cumsum())
+        panel = self._panel(np.concatenate([high, low]))
+        mean, std = rolling_mean_std(panel, 24)
+
+        tail = panel["A"].to_numpy()[-24:]
+        assert mean["A"].iloc[-1] == pytest.approx(tail.mean(), rel=1e-12)
+        assert std["A"].iloc[-1] == pytest.approx(tail.std(), rel=1e-12)
+        assert (std["A"].iloc[230:] > 0).all()
+
+    def test_constant_window_has_exactly_zero_std(self):
+        panel = self._panel([0.1, 0.2, 0.3, 0.3, 0.3, 0.3])
+        mean, std = rolling_mean_std(panel, 3)
+        assert std["A"].iloc[-1] == 0.0
+        assert mean["A"].iloc[-1] == 0.3
+        assert std["A"].iloc[2] > 0
+
+    def test_nan_in_window_and_warmup_yield_nan(self):
+        panel = self._panel([1.0, 2.0, np.nan, 4.0, 5.0, 6.0, 7.0])
+        mean, std = rolling_mean_std(panel, 3)
+        assert mean["A"].isna().tolist() == [True, True, True, True, True, False, False]
+        assert std["A"].isna().tolist() == [True, True, True, True, True, False, False]
+
+    def test_window_longer_than_panel_is_all_nan(self):
+        mean, std = rolling_mean_std(self._panel([1.0, 2.0]), 5)
+        assert mean.isna().all().all() and std.isna().all().all()
+
+    def test_ddof(self):
+        panel = self._panel([1.0, 2.0, 4.0])
+        _, std = rolling_mean_std(panel, 3, ddof=1)
+        assert std["A"].iloc[-1] == pytest.approx(np.std([1.0, 2.0, 4.0], ddof=1))

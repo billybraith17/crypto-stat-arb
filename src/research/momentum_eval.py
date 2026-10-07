@@ -68,30 +68,45 @@ def compute_ic_series(signal_wide, forward_return_wide, method="spearman", min_a
     (see ``min_assets_per_timestamp`` in ``cross_sectional_rank_or_zscore``).
     Timestamps where either side has zero variance (e.g. a fully-tied rank row,
     or the benchmark column of a ``minus_benchmark`` panel left alone after
-    masking) are also returned as NaN, which suppresses scipy's
-    ``ConstantInputWarning`` for genuinely undefined correlations.
+    masking) are also returned as NaN: the correlation is undefined there.
+    Spearman IC is the row-wise Pearson correlation of average ranks taken
+    over the valid pairs. The index holds every timestamp with at least one
+    valid pair.
     """
-    joined = pd.concat(
-        [signal_wide.stack().rename("signal"), forward_return_wide.stack().rename("fwd_ret")],
-        axis=1,
-    ).dropna()
-    if joined.empty:
-        return pd.Series(dtype=float)
-
     min_assets = int(min_assets)
     if min_assets < 2:
         raise ValueError("min_assets must be >= 2 (Spearman/Pearson need >=2 points)")
+    if method not in ("spearman", "pearson"):
+        raise ValueError("method must be 'spearman' or 'pearson'")
 
-    def _corr(group):
-        if len(group) < min_assets:
-            return np.nan
-        signal = group["signal"]
-        fwd = group["fwd_ret"]
-        if signal.nunique(dropna=True) < 2 or fwd.nunique(dropna=True) < 2:
-            return np.nan
-        return signal.corr(fwd, method=method)
+    signal, fwd = signal_wide.align(forward_return_wide, join="outer")
+    valid = signal.notna() & fwd.notna()
+    n_valid = valid.sum(axis=1)
+    has_pairs = n_valid > 0
+    if not has_pairs.any():
+        return pd.Series(dtype=float)
 
-    return joined.groupby(level=0).apply(_corr)
+    signal = signal.where(valid)[has_pairs]
+    fwd = fwd.where(valid)[has_pairs]
+    n_valid = n_valid[has_pairs]
+    if method == "spearman":
+        signal = signal.rank(axis=1)
+        fwd = fwd.rank(axis=1)
+
+    x = signal.to_numpy(dtype=float)
+    y = fwd.to_numpy(dtype=float)
+    x_dev = x - np.nanmean(x, axis=1, keepdims=True)
+    y_dev = y - np.nanmean(y, axis=1, keepdims=True)
+    cov = np.nansum(x_dev * y_dev, axis=1)
+    denom = np.sqrt(np.nansum(x_dev**2, axis=1) * np.nansum(y_dev**2, axis=1))
+
+    constant = (np.nanmax(x, axis=1) == np.nanmin(x, axis=1)) | (
+        np.nanmax(y, axis=1) == np.nanmin(y, axis=1)
+    )
+    defined = (n_valid.to_numpy() >= min_assets) & ~constant
+    ic = np.full(len(signal), np.nan)
+    ic[defined] = cov[defined] / denom[defined]
+    return pd.Series(ic, index=signal.index)
 
 
 def ic_summary(ic_series, nw_lag=0):

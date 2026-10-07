@@ -1,6 +1,6 @@
 """Pipeline orchestration helpers."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from src.common.run_logging import (
@@ -19,7 +19,7 @@ def execute_pipeline(engine, settings):
     create_run_logging_tables(engine)
 
     run_id = str(uuid4())
-    run_ts = datetime.now(timezone.utc)
+    run_ts = datetime.now(UTC)
     pipeline_name = settings.get("pipeline_name", "core_pipeline")
     version_tag = settings.get("version_tag")
 
